@@ -6,3 +6,6 @@ __pycache__/
 venv/
 *.egg-info/
 .firebase/
+bluesky/reply/state.json
+bluesky/reply/dm_state.json
+SX_Instructions.md
