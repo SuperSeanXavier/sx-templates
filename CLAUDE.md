@@ -65,9 +65,6 @@ python bluesky/reply/scan_and_test.py
 # Target posts from ~N days ago (paginates automatically)
 python bluesky/reply/scan_and_test.py --days-ago 3
 
-# Test discount incentive in DM pull
-python bluesky/reply/scan_and_test.py --discount "20% off — DM me for the link"
-
 # Test peer/creator register flow (scans last 25 posts for creator replies)
 # Falls back to a generated fake exchange if none found
 python bluesky/reply/scan_and_test.py --creator
@@ -79,18 +76,19 @@ python bluesky/reply/scan_and_test.py --creator
 
 ### Fan reply routing
 
+All post types (personal, casual, promotional, content) feed the same funnel. A 75% gate controls nudging — 25% of replies are friendly conversation only, regardless of post type.
+
 ```
-post_type = classify_post_type(root_post)
-
-if personal or casual post:
-    → friendly reply, no funnel
-
-if promotional or content post:
-    first reply   → nudging question (steers toward buying signals)
+75% of fan replies:
+    first reply   → nudging question (steers toward DMs)
     follow-up     → classify_fan_intent()
-        buying_signal or curious  → DM pull (+ discount if qualified)
+        buying_signal or curious  → DM pull (no discount code in public reply)
         casual / no signal        → another nudging question
         depth >= MAX_DEPTH (3)    → force DM pull
+    after DM pull → Firestore conversations doc created for the fan
+
+25% of fan replies:
+    → friendly reply only, no funnel
 ```
 
 ### Subscriber guard
@@ -98,23 +96,22 @@ Before any fan routing: if the reply mentions being an existing subscriber/membe
 
 ### Discount rules
 
-**Reply-thread DM pull** (public reply → fan steered to DMs):
-- Fan intent is `buying_signal` (not just `curious`)
-- Post type is `promotional`
+Discounts are offered **only inside DM conversations** — never in public reply DM pulls.
+
+**DM conversation discount** (`poll_inbound_dms`):
+- Fan's DM is classified as `buying_signal` or `curious`
 - `FAN_DISCOUNT_CODE` env var is set (falls back to legacy `DISCOUNT_OFFER`)
-- Daily cap not exceeded (`MAX_DISCOUNTS_PER_DAY`, default 5)
-- Link used: `FAN_DISCOUNT_URL_REPLY` (`bdmp`)
+- `discount_sent` flag is not already set on the conversation Firestore doc (one discount per fan ever)
+- Link used: `FAN_DISCOUNT_URL_DM` (falls back to `FAN_DISCOUNT_URL_REPLY`)
+
+After the discount is sent, `discount_sent: true` is written to the conversation doc. Subsequent messages from the same fan route to `generate_dm_funnel_reply` with `discount=None`, which steers toward the site without repeating the code.
 
 Tracking URLs by source:
-| Source | URL env var | Link |
-|---|---|---|
-| Reply-thread DM pull | `FAN_DISCOUNT_URL_REPLY` | `bdmp` |
-| Like-triggered DM | `FAN_DISCOUNT_URL_LIKE` | `bdml` |
-| Repost-triggered DM | `FAN_DISCOUNT_URL_REPOST` | `bdmr` |
-
-**Proactive DM discounts** (like/repost initial outreach) are not yet wired up — the `generate_like_dm` / `generate_repost_dm` functions accept a `discount` param but it is not currently populated through the queue path.
-
-**DM conversation CTA** fires automatically after 2 fan exchanges in an ongoing conversation (`exchange_count >= 2` in `poll_inbound_dms`). Requires `FAN_DISCOUNT_URL_REPLY` (or `FAN_DISCOUNT_URL_DM`) to be set. Link and optional `FAN_DISCOUNT_CODE` are injected as a natural invitation — not a hard pitch. The consecutive-unanswered guard in `poll_inbound_dms` (skip if Sean sent the last message) ensures the CTA never fires into silence.
+| Source | URL env var |
+|---|---|
+| DM conversation (any trigger) | `FAN_DISCOUNT_URL_DM` → fallback `FAN_DISCOUNT_URL_REPLY` |
+| Like-triggered DM | `FAN_DISCOUNT_URL_LIKE` *(initial outreach only — no discount)* |
+| Repost-triggered DM | `FAN_DISCOUNT_URL_REPOST` *(initial outreach only — no discount)* |
 
 ### DM pull phrase variety
 Used pulls are tracked per root post URI in `state.json`. Each new DM pull is shown previous ones and told to avoid similar phrasing.
@@ -157,7 +154,7 @@ When two or more signals are active, two must trigger (except mutual_follow alon
 - `my_reply_uris` — URIs of the bot's own replies (follow-up detection)
 - `dm_pulls_by_root` — DM pull text per root post URI (phrase variety)
 - `conversation_depth` — follow-up round count per root post URI
-- `daily_discounts` — discount count per date (cap enforcement)
+- `daily_discounts` — discount count per date (legacy field; no longer incremented — per-handle cap is now `discount_sent` in Firestore)
 - `blocked_users` — permanent skip list
 - `paused_users` — temporary per-user pause
 - `bot_status` — `"running"` | `"paused"`
@@ -177,7 +174,7 @@ See `BLUESKY_ENGAGEMENT_SPEC.md` → Database section for full field specs.
 | `target_accounts` | Ranked anchor accounts per domain (tiers 1–3) |
 | `engagement_events` | Raw notification log — reply, like, repost, follow |
 | `dm_queue` | Outbound DMs awaiting batch send |
-| `conversations` | Per-fan DM thread state and stage |
+| `conversations` | Per-fan DM thread state and stage (`warm` → `engaged` / `converted` / `subscriber`; `dm_pull_sent` for public-reply-to-DM path) |
 | `messages` | Full message history per conversation (subcollection) |
 | `comment_queue` | Generated comments awaiting posting |
 | `seen_events` | Notification URI dedup log |
@@ -221,6 +218,21 @@ Triggered by likes and reposts. Controlled by `DM_ENABLED` env var (default `tru
 DM copy rules:
 - Explicitly acknowledge the action — say they liked it / reposted it. Don't be vague.
 - Use "Thanks" not "Appreciate"
+
+### DM conversation funnel (`poll_inbound_dms`)
+
+When a fan replies to any outreach DM (like/repost initial DM, or after a public reply DM pull), `poll_inbound_dms` classifies their message and routes to the appropriate generator:
+
+| Fan message | Generator | Stage written |
+|---|---|---|
+| Subscriber mention | `generate_dm_subscriber_reply` — warm thanks, asks about their favourite content | `subscriber` |
+| `buying_signal` or `curious` (first time) | `generate_dm_funnel_reply` with discount code | `converted` |
+| `buying_signal` or `curious` (discount already sent) | `generate_dm_funnel_reply` without code, steers to site | `engaged` |
+| Casual / neutral | `generate_conversation_reply` (CTA suppressed) | `engaged` |
+
+`generate_dm_funnel_reply` uses the same `_score_thread_signal` scoring as `generate_conversation_reply` — tone and register mirror the fan's energy level (low/medium/high tiers). The promotional offer is woven in at that register, not as a sales pivot.
+
+The discount fires intent-driven — most fans hit it on the 2nd or 3rd exchange. `discount_sent: true` in Firestore prevents a second code being sent to the same fan.
 
 Anti-spam rules (all types):
 - Same notification URI already seen → skip (dedup via Firestore `seen_events`)

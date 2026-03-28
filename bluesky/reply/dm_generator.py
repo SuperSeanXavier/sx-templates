@@ -338,6 +338,110 @@ def _cta_instruction(exchange_count: int) -> str:
     return _CTA_INSTRUCTION.format(url=url, discount_line=discount_line)
 
 
+_DM_SUBSCRIBER_REPLY_PROMPT = """{brand_voice}
+
+---
+
+You are in a DM conversation with a fan on Bluesky who has just mentioned that they're already a subscriber or member.
+
+Their handle: @{handle}
+
+Conversation so far:
+{history}
+
+Their latest message:
+{their_message}
+
+---
+
+They're already supporting you. Respond warmly — acknowledge their support and invite them to share what they enjoy most about your content.
+No pitch. No discount. No mention of subscribing or signing up.
+Do not add emojis unless they feel completely natural.
+2 sentences maximum."""
+
+_DM_FUNNEL_REPLY_PROMPT = """{brand_voice}
+
+---
+
+You are in a DM conversation with a fan on Bluesky who has shown genuine interest in your content.
+
+Their handle: @{handle}
+
+Conversation so far:
+{history}
+
+Their latest message:
+{their_message}
+
+---
+
+{adaptive_instruction}
+
+{cta_instruction}Do not add emojis unless they feel completely natural.
+2-3 sentences maximum."""
+
+_DM_FUNNEL_CTA = """This fan has shown real interest. Weave in a natural, genuine mention of where they can see more — \
+frame it as a personal invitation, not a pitch. Include this link: {url}
+"""
+
+_DM_FUNNEL_CTA_WITH_DISCOUNT = """This fan has shown buying interest. Naturally weave in a genuine offer: use code {code} \
+for 50% off at SeanXavier.com. Include this link: {url}
+Make it feel like a personal gift, not a sales pivot. Keep it in the same register as the rest of the conversation.
+"""
+
+
+def generate_dm_subscriber_reply(handle, their_message, history, brand_voice):
+    """Reply to a fan who mentions they're already subscribed — warm thanks, no pitch."""
+    history_text = "\n".join(
+        f"{'You' if h['role'] == 'assistant' else 'Fan'}: {h['content']}"
+        for h in history[-10:]
+    )
+    prompt = _DM_SUBSCRIBER_REPLY_PROMPT.format(
+        brand_voice=brand_voice,
+        handle=handle,
+        history=history_text or "(no prior messages)",
+        their_message=their_message,
+    )
+    return _call(_SYSTEM, prompt)
+
+
+def generate_dm_funnel_reply(handle, their_message, history, brand_voice, discount=None):
+    """
+    Reply to a fan showing buying signal/curiosity.
+
+    Uses the same thread-signal scoring as generate_conversation_reply to adapt
+    tone and register. Adds a CTA layer — with the discount code if provided,
+    or a no-code mention of the site if not (e.g. discount already sent).
+    """
+    fan_messages = [
+        h["content"] for h in history[-10:] if h["role"] != "assistant"
+    ] + [their_message]
+    _, tier = _score_thread_signal(fan_messages)
+
+    history_text = "\n".join(
+        f"{'You' if h['role'] == 'assistant' else 'Fan'}: {h['content']}"
+        for h in history[-10:]
+    )
+
+    if discount:
+        code = discount.get("code", "")
+        url = discount.get("url", "")
+        cta = _DM_FUNNEL_CTA_WITH_DISCOUNT.format(code=code, url=url)
+    else:
+        url = os.environ.get("FAN_DISCOUNT_URL_DM") or os.environ.get("FAN_DISCOUNT_URL_REPLY", "")
+        cta = _DM_FUNNEL_CTA.format(url=url) if url else ""
+
+    prompt = _DM_FUNNEL_REPLY_PROMPT.format(
+        brand_voice=brand_voice,
+        handle=handle,
+        history=history_text or "(no prior messages)",
+        their_message=their_message,
+        adaptive_instruction=_ADAPTIVE_INSTRUCTIONS[tier],
+        cta_instruction=cta,
+    )
+    return _call(_SYSTEM, prompt)
+
+
 def generate_conversation_reply(handle, their_message, history, brand_voice, exchange_count=0):
     """Generate a reply to an inbound DM in an ongoing conversation."""
     fan_messages = [

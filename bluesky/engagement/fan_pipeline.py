@@ -23,7 +23,10 @@ from bluesky.reply.dm_generator import (
     generate_themed_repost_dm,
     generate_studio_repost_dm,
     generate_conversation_reply,
+    generate_dm_subscriber_reply,
+    generate_dm_funnel_reply,
 )
+from bluesky.reply.reply_generator import classify_fan_intent, classify_subscriber_mention
 from bluesky.engagement.handoff import check_handoff_triggers, flag_handoff
 
 DAILY_DM_CAP = int(os.environ.get("DAILY_DM_CAP", "50"))
@@ -160,6 +163,15 @@ def _daily_sent_count():
 def _already_dmed(fan_handle):
     """True if we've ever initiated outreach to this handle."""
     return db.collection("conversations").document(fan_handle).get().exists
+
+
+def _resolve_dm_discount():
+    """Return discount dict if env vars are set, else None."""
+    code = os.environ.get("FAN_DISCOUNT_CODE") or os.environ.get("DISCOUNT_OFFER")
+    url = os.environ.get("FAN_DISCOUNT_URL_DM") or os.environ.get("FAN_DISCOUNT_URL_REPLY")
+    if not code:
+        return None
+    return {"code": code, "url": url}
 
 
 def _get_pending_batch(batch_size):
@@ -496,8 +508,25 @@ def poll_inbound_dms(client, brand_voice, dry_run=False):
             handoffs_triggered += 1
             continue
 
+        # Classify the fan's message to route to the right generator
+        is_subscriber = classify_subscriber_mention(their_message)
+        intent = classify_fan_intent(their_message)
+
+        discount_sent = None
         try:
-            dm_reply = generate_conversation_reply(handle, their_message, history, brand_voice, exchange_count=exchange_count)
+            if is_subscriber:
+                dm_reply = generate_dm_subscriber_reply(handle, their_message, history, brand_voice)
+                new_stage = "subscriber"
+            elif intent in ("buying_signal", "curious"):
+                already_discounted = convo_data.get("discount_sent", False)
+                discount = _resolve_dm_discount() if not already_discounted else None
+                dm_reply = generate_dm_funnel_reply(handle, their_message, history, brand_voice, discount=discount)
+                discount_sent = discount
+                new_stage = "converted" if discount else "engaged"
+            else:
+                # Casual/neutral — keep engaging; suppress built-in CTA (intent gate owns that)
+                dm_reply = generate_conversation_reply(handle, their_message, history, brand_voice, exchange_count=0)
+                new_stage = "engaged"
         except Exception as e:
             print(f"  [warn] reply generation failed for @{handle}: {e}")
             continue
@@ -514,11 +543,14 @@ def poll_inbound_dms(client, brand_voice, dry_run=False):
                 client.send_dm(convo_id, dm_reply)
                 now = datetime.now(timezone.utc).isoformat()
 
-                db.collection("conversations").document(handle).update({
-                    "stage": "engaged",
+                update_payload = {
+                    "stage": new_stage,
                     "last_message_at": now,
                     "last_fan_message": their_message,
-                })
+                }
+                if discount_sent:
+                    update_payload["discount_sent"] = True
+                db.collection("conversations").document(handle).update(update_payload)
 
                 dt = datetime.now(timezone.utc)
                 msgs = db.collection("conversations").document(handle).collection("messages")
@@ -534,9 +566,10 @@ def poll_inbound_dms(client, brand_voice, dry_run=False):
                 replies_sent += 1
         else:
             print(f"  [dry-run]")
-            db.collection("conversations").document(handle).update({
-                "last_fan_message": their_message,
-            })
+            dry_update = {"last_fan_message": their_message, "stage": new_stage}
+            if discount_sent:
+                dry_update["discount_sent"] = True
+            db.collection("conversations").document(handle).update(dry_update)
             replies_sent += 1
 
     return {

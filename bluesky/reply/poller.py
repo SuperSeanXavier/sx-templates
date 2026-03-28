@@ -38,7 +38,6 @@ from bluesky.reply.reply_generator import (
     generate_themed_reply,
     simulate_fan_reply,
     load_brand_voice,
-    GATED_POST_TYPES,
     PITCH_INTENT,
 )
 from bluesky.reply.state_manager import StateManager
@@ -119,24 +118,6 @@ def _classify_user(handle, client, dm_state):
     except Exception as e:
         print(f"  [warn] could not classify @{handle}: {e}")
         return "fan", 0
-
-
-def _resolve_discount(intent, post_type, state):
-    """
-    Return discount offer string for reply-thread DM pulls, or None if conditions not met.
-    Used in the public reply → DM pull flow (not proactive DMs).
-    """
-    code = os.environ.get("FAN_DISCOUNT_CODE") or os.environ.get("DISCOUNT_OFFER")
-    if not code:
-        return None
-    if intent != "buying_signal":
-        return None
-    if post_type != "promotional":
-        return None
-    if not state.discount_allowed():
-        return None
-    url = os.environ.get("FAN_DISCOUNT_URL_REPLY", "")
-    return f"code {code} for 50% off at SeanXavier.com{' — ' + url if url else ''}"
 
 
 
@@ -259,15 +240,13 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
         return "subscriber_thanks"
 
     post_type = classify_post_type(root_text)
-    is_gated = post_type in GATED_POST_TYPES
 
     print(f"  @{handle}: {reply_text[:100]}")
-    print(f"  [post type: {post_type}{'  (gated)' if is_gated else ''}]")
+    print(f"  [post type: {post_type}]")
 
-    if is_gated:
-        # Friendly conversation only — no funnel on personal/casual posts
+    if random.random() > 0.75:
+        # 25% → friendly reply, no nudge (preserves organic variety across all post types)
         generated = generate_reply(parent_text, reply_text, handle, brand_voice, nudge=False)
-        discount_used = False
         action = "fan_casual"
 
     elif is_followup:
@@ -275,32 +254,28 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
         print(f"  [intent: {intent}]")
 
         if intent in PITCH_INTENT or state.at_max_depth(root_uri):
-            discount = _resolve_discount(intent, post_type, state)
             used_pulls = state.get_dm_pulls(root_uri)
             generated = generate_dm_pull_reply(
                 parent_text, reply_text, handle, brand_voice,
-                used_pulls=used_pulls, discount=discount,
+                used_pulls=used_pulls,
             )
-            discount_used = discount is not None
-            action = "fan_dm_pull_discount" if discount_used else "fan_dm_pull"
-            print(f"  [dm pull{', discount' if discount_used else ''}]")
+            action = "fan_dm_pull"
+            print("  [dm pull]")
         else:
             # Keep nudging — fan hasn't shown buying signal yet
             generated = generate_reply(parent_text, reply_text, handle, brand_voice, nudge=True)
-            discount_used = False
             action = "fan_nudge"
 
     else:
         # First reply to Sean's post — start the conversation with a nudging question
         generated = generate_reply(parent_text, reply_text, handle, brand_voice, nudge=True)
-        discount_used = False
         action = "fan_nudge"
 
     print(f"  → {generated}")
 
     if dry_run:
         state.mark_replied(post_uri)
-        if not is_gated and not is_followup:
+        if action == "fan_nudge" and not is_followup:
             _dry_run_simulate(handle, generated, root_text, brand_voice, root_uri, state)
         print("  [dry-run, not posted]")
         return action
@@ -327,11 +302,23 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
             )
             state.mark_replied(post_uri)
             state.add_my_reply(response.uri)
-            if is_followup:
-                if intent in PITCH_INTENT or state.at_max_depth(root_uri):
+            if is_followup and action != "fan_casual":
+                if action == "fan_dm_pull":
                     state.add_dm_pull(root_uri, generated)
-                    if discount_used:
-                        state.record_discount()
+                    # Create Firestore conversations record so poll_inbound_dms
+                    # recognises the fan when they DM after the public reply pull.
+                    now = datetime.now(timezone.utc).isoformat()
+                    db.collection("conversations").document(handle).set({
+                        "stage": "dm_pull_sent",
+                        "trigger_context": "reply_dm_pull",
+                        "trigger_post_text": root_text[:300],
+                        "fan_handle": handle,
+                        "human_handoff": False,
+                        "handoff_reason": None,
+                        "created_at": now,
+                        "last_message_at": now,
+                        "last_fan_message": None,
+                    }, merge=True)
                 else:
                     state.increment_depth(root_uri)
             print("  [posted]")
@@ -432,7 +419,6 @@ def run_once(client, state, brand_voice, dry_run, dm_state=None):
         "fan_nudge": 0,
         "fan_casual": 0,
         "fan_dm_pull": 0,
-        "fan_dm_pull_discount": 0,
         "creator_reply": 0,
         "studio_reply": 0,
         "themed_reply": 0,
