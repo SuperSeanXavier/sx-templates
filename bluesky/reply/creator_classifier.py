@@ -24,6 +24,10 @@ import os
 CREATOR_FOLLOWER_THRESHOLD = int(os.environ.get("CREATOR_FOLLOWER_THRESHOLD", "500"))
 COLLAB_DM_THRESHOLD = int(os.environ.get("COLLAB_DM_THRESHOLD", "20000"))
 
+# --- Bot detection ---
+BOT_SCORE_THRESHOLD = 50  # matches existing minimum follower floor
+BOT_SCORE_SKIP = 5        # skip if score >= this value
+
 # --- Creator detection flags ---
 _FLAG_MUTUAL_FOLLOW = os.environ.get("CREATOR_DETECTION_MUTUAL_FOLLOW", "false").lower() == "true"
 _FLAG_BIO = os.environ.get("CREATOR_DETECTION_BIO", "false").lower() == "true"
@@ -146,6 +150,44 @@ def classify_user(profile, flags=None):
         return UserClassification("creator", follower_count, ", ".join(signals_hit))
 
     return UserClassification("fan", follower_count, "none")
+
+
+def bot_score(profile):
+    """
+    Score a fan profile for bot likelihood (0–11). Applied to fan-type accounts only.
+    Skip DMing if score >= BOT_SCORE_SKIP (5).
+
+    Signals:
+      +3  followers <= 50 (suspiciously low reach)
+      +2  posts <= 5 (almost no content)
+      +2  following > 2000 and followers < 200 (mass-follow bot pattern)
+      +2  follow_ratio < 0.05 (follows far more than follows back)
+      +1  no avatar
+      +1  no display name
+    """
+    followers = getattr(profile, "followers_count", 0) or 0
+    following = getattr(profile, "follows_count", 0) or 0
+    posts = getattr(profile, "posts_count", 0) or 0
+    avatar = getattr(profile, "avatar", None)
+    display_name = (getattr(profile, "display_name", None) or "").strip()
+
+    score = 0
+
+    if followers <= BOT_SCORE_THRESHOLD:
+        score += 3
+    if posts <= 5:
+        score += 2
+    if following > 2000 and followers < 200:
+        score += 2
+    follow_ratio = followers / following if following > 0 else 0
+    if follow_ratio < 0.05:
+        score += 2
+    if not avatar:
+        score += 1
+    if not display_name:
+        score += 1
+
+    return score
 
 
 # Backward-compat alias used in existing code

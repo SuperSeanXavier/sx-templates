@@ -1,0 +1,32 @@
+{
+  "hosting": {
+    "public": "bluesky/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**",
+      "api/**",
+      "specs/**",
+      "mockups/**",
+      "Dockerfile",
+      "cloudbuild.yaml"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/dashboard.html"
+      }
+    ],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          {
+            "key": "X-Content-Type-Options",
+            "value": "nosniff"
+          }
+        ]
+      }
+    ]
+  }
+}

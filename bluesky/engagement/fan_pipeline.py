@@ -13,9 +13,12 @@ from datetime import datetime, timezone, timedelta, date
 
 from google.cloud.firestore_v1.base_query import FieldFilter as _filter
 from bluesky.shared.firestore_client import db
+from bluesky.shared.cost_calculator import write_cost_event
 from bluesky.shared.rate_limiter import (
     check_write, seconds_until_next_write, RateLimitError,
+    check_dm_write, seconds_until_next_dm_write, is_active_hours,
 )
+from zoneinfo import ZoneInfo
 from bluesky.reply.dm_generator import (
     generate_like_dm,
     generate_repost_dm,
@@ -30,14 +33,19 @@ from bluesky.reply.reply_generator import classify_fan_intent, classify_subscrib
 from bluesky.engagement.handoff import check_handoff_triggers, flag_handoff
 
 DAILY_DM_CAP = int(os.environ.get("DAILY_DM_CAP", "50"))
-PRIORITY_MAP = {"follow": 3, "repost": 2, "like": 1}
+PRIORITY_MAP = {"follow": 3, "repost": 2, "like": 1, "comment_exchange": 2}
+DASHBOARD_LOOKBACK_DAYS = 30  # matches the maximum time range on the dashboard
+ENGAGEMENT_DM_RECENCY_HOURS = 1  # skip engagement DMs if interaction is older than this
+
+_ACTIVE_TZ = ZoneInfo("America/Los_Angeles")
 
 
 # ---------------------------------------------------------------------------
 # Queue
 # ---------------------------------------------------------------------------
 
-def queue_dm(fan_handle, fan_did, trigger_type, post_context, user_type, interaction_at=None):
+def queue_dm(fan_handle, fan_did, trigger_type, post_context, user_type,
+             interaction_at=None, post_created_at=None):
     """Add an outbound DM to the Firestore queue."""
     priority = PRIORITY_MAP.get(trigger_type, 1)
     now = datetime.now(timezone.utc).isoformat()
@@ -50,6 +58,7 @@ def queue_dm(fan_handle, fan_did, trigger_type, post_context, user_type, interac
         "priority": priority,
         "status": "pending",
         "interaction_at": interaction_at or now,
+        "post_created_at": post_created_at or now,
         "created_at": now,
         "sent_at": None,
         "sent_date": None,
@@ -104,13 +113,13 @@ def send_engagement_dm(client, handle, fan_did, trigger_type, post_context, user
         print(f"  [dry-run]")
         return "sent"
 
-    wait = seconds_until_next_write()
+    wait = seconds_until_next_dm_write()
     if wait > 0:
-        print(f"  [rate] waiting {wait:.0f}s for write window...")
+        print(f"  [dm rate] waiting {wait:.0f}s for DM write window...")
         time.sleep(wait)
 
     try:
-        check_write("create")
+        check_dm_write()
         client.send_dm(convo_id, dm_text)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -134,6 +143,19 @@ def send_engagement_dm(client, handle, fan_did, trigger_type, post_context, user
             "timestamp": now,
         })
 
+        try:
+            db.collection("engagement_events").add({
+                "type": "dm",
+                "direction": "outbound",
+                "handle": handle,
+                "post_uri": None,
+                "reply_type": "dm_outreach",
+                "interaction_subtype": f"{trigger_type}_trigger",
+                "user_type": user_type,
+                "created_at": now,
+            })
+        except Exception:
+            pass
         print(f"  [sent]")
         return "sent"
 
@@ -338,14 +360,29 @@ def process_dm_queue(client, brand_voice, batch_size=15, dry_run=False):
                     "timestamp": now,
                 })
 
+                try:
+                    db.collection("engagement_events").add({
+                        "type": "dm",
+                        "direction": "outbound",
+                        "handle": handle,
+                        "post_uri": None,
+                        "reply_type": "dm_outreach",
+                        "interaction_subtype": f"{trigger}_trigger",
+                        "user_type": user_type,
+                        "created_at": now,
+                    })
+                except Exception:
+                    pass
+
                 sent += 1
                 by_user_type[user_type] = by_user_type.get(user_type, 0) + 1
                 by_trigger[trigger] = by_trigger.get(trigger, 0) + 1
                 print(f"  [sent]")
 
-                # Stagger: 8–20 min between sends (skip sleep after last item)
+                # Stagger: 5–15 min between sends (skip sleep after last item)
+                # 10 items × 300s min = 3000s — fits within the 3600s CF timeout
                 if i < len(batch) - 1 and daily_count + sent < DAILY_DM_CAP:
-                    stagger = random.uniform(480, 1200)
+                    stagger = random.uniform(300, 900)
                     print(f"  [stagger] {stagger / 60:.1f} min until next send...")
                     time.sleep(stagger)
 
@@ -375,8 +412,205 @@ def process_dm_queue(client, brand_voice, batch_size=15, dry_run=False):
 
 
 # ---------------------------------------------------------------------------
+# Engagement DM queue executor (likes / reposts / comment_exchange)
+# ---------------------------------------------------------------------------
+
+def _in_inbound_dm_burst_window():
+    """
+    True if current Pacific time is within 60 min of a 3-hour boundary (0, 3, 6, 9, 12...).
+    Used to gate poll_inbound_dms — only process inbound DMs during burst windows.
+    """
+    now_local = datetime.now(_ACTIVE_TZ)
+    minutes_since_boundary = (now_local.hour % 3) * 60 + now_local.minute
+    return minutes_since_boundary < 60
+
+
+def execute_engagement_dm_queue(client, brand_voice, batch_size=10, dry_run=False):
+    """
+    Drain pending like/repost/comment_exchange DMs.
+    Only processes items where interaction_at is within the last ENGAGEMENT_DM_RECENCY_HOURS.
+    Sorted by interaction_at DESC (most recent engagement first).
+    Uses the DM-specific 60s write window (independent of the 4-min public write window).
+    """
+    if not is_active_hours():
+        print("[engagement_dms] outside active hours — skipping")
+        return {"skipped": "outside_active_hours", "sent": 0}
+
+    engagement_types = {"like", "repost", "comment_exchange"}
+    now = datetime.now(timezone.utc)
+    recency_cutoff = (now - timedelta(hours=ENGAGEMENT_DM_RECENCY_HOURS)).isoformat()
+
+    docs = (
+        db.collection("dm_queue")
+        .where(filter=_filter("status", "==", "pending"))
+        .stream()
+    )
+    items = [
+        {"id": d.id, **d.to_dict()} for d in docs
+        if d.to_dict().get("trigger_type") in engagement_types
+    ]
+    # Most recent engagement first
+    items.sort(key=lambda x: x.get("interaction_at", ""), reverse=True)
+    items = items[:batch_size]
+
+    print(f"[engagement_dms] {len(items)} pending engagement DM(s)")
+
+    sent = 0
+    skipped_too_old = 0
+    skipped_already_dmed = 0
+    skipped_other = 0
+    first_send = True
+
+    for item in items:
+        doc_ref = db.collection("dm_queue").document(item["id"])
+        handle = item["fan_handle"]
+        interaction_at = item.get("interaction_at", "")
+
+        # Recency gate: skip if engagement is older than 1hr
+        if interaction_at and interaction_at < recency_cutoff:
+            doc_ref.update({"status": "skipped", "skip_reason": "engagement_too_old"})
+            skipped_too_old += 1
+            print(f"  [skip] @{handle} engagement too old ({interaction_at[:19]})")
+            continue
+
+        if _already_dmed(handle):
+            doc_ref.update({"status": "skipped", "skip_reason": "already_dmed"})
+            skipped_already_dmed += 1
+            print(f"  [skip] @{handle} already has an outreach conversation")
+            continue
+
+        # Human pacing: 90–600s between sends (skip before the first send)
+        if not first_send and not dry_run:
+            stagger = random.uniform(90, 600)
+            print(f"  [stagger] {stagger:.0f}s before next DM...")
+            time.sleep(stagger)
+
+        trigger = item.get("trigger_type", "like")
+        user_type = item.get("user_type", "fan")
+        post_context = item.get("post_context", "")
+        fan_did = item.get("fan_did", "")
+
+        result = send_engagement_dm(
+            client, handle, fan_did, trigger,
+            post_context, user_type, brand_voice, dry_run=dry_run,
+        )
+
+        if result == "sent":
+            doc_ref.update({
+                "status": "sent",
+                "sent_at": now.isoformat(),
+                "sent_date": now.date().isoformat(),
+            })
+            sent += 1
+            first_send = False
+        elif result == "skipped":
+            doc_ref.update({"status": "skipped", "skip_reason": "already_dmed"})
+            skipped_already_dmed += 1
+        else:
+            skipped_other += 1
+
+    print(f"[engagement_dms] done — sent: {sent}, too_old: {skipped_too_old}, "
+          f"already_dmed: {skipped_already_dmed}, other: {skipped_other}")
+    return {
+        "sent": sent,
+        "skipped_too_old": skipped_too_old,
+        "skipped_already_dmed": skipped_already_dmed,
+        "skipped_other": skipped_other,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Inbound DM polling
 # ---------------------------------------------------------------------------
+
+def _snapshot_my_posts(client):
+    """
+    Write engagement_events for any new posts published by this account.
+    Paginates get_author_feed until all posts within a 30-day lookback are
+    captured, matching the maximum dashboard time range.
+    Called at the start of each poll_inbound_dms cycle.
+    """
+    handle = os.environ.get("BLUESKY_HANDLE", "")
+    if not handle:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DASHBOARD_LOOKBACK_DAYS)
+
+    # Build set of already-tracked post URIs
+    existing = set()
+    try:
+        for doc in (
+            db.collection("engagement_events")
+            .where(filter=_filter("type", "==", "post"))
+            .stream()
+        ):
+            uri = doc.to_dict().get("post_uri")
+            if uri:
+                existing.add(uri)
+    except Exception as e:
+        print(f"[snapshot_posts] existing URI fetch failed: {e}")
+
+    new_count = 0
+    cursor = None
+
+    while True:
+        try:
+            resp = client.get_author_feed(handle, limit=100, cursor=cursor)
+        except Exception as e:
+            print(f"[snapshot_posts] feed fetch failed: {e}")
+            break
+
+        feed = getattr(resp, "feed", []) or []
+        if not feed:
+            break
+
+        done = False
+        for feed_item in feed:
+            post = getattr(feed_item, "post", None)
+            if not post:
+                continue
+            uri = getattr(post, "uri", None)
+            if not uri:
+                continue
+
+            record = getattr(post, "record", None)
+            created_at = getattr(record, "created_at", None) or datetime.now(timezone.utc).isoformat()
+
+            # Stop paginating once posts fall outside the 30-day window
+            try:
+                post_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if post_dt < cutoff:
+                    done = True
+                    break
+            except Exception:
+                pass
+
+            if uri in existing:
+                continue
+
+            text = getattr(record, "text", "") or ""
+            try:
+                db.collection("engagement_events").add({
+                    "type": "post",
+                    "direction": "outbound",
+                    "handle": handle,
+                    "post_uri": uri,
+                    "post_text": text[:300],
+                    "created_at": created_at,
+                })
+                existing.add(uri)
+                new_count += 1
+            except Exception as e:
+                print(f"[snapshot_posts] write failed for {uri}: {e}")
+
+        cursor = getattr(resp, "cursor", None)
+        if done or not cursor:
+            break
+
+    if new_count:
+        print(f"[snapshot_posts] wrote {new_count} new post event(s)")
+    return new_count
+
 
 def poll_inbound_dms(client, brand_voice, dry_run=False):
     """
@@ -393,6 +627,52 @@ def poll_inbound_dms(client, brand_voice, dry_run=False):
     Only replies to conversations we initiated (have a Firestore record for).
     Unsolicited inbound DMs are ignored.
     """
+    if not is_active_hours():
+        print("[inbound_dms] outside active hours — skipping")
+        return {"skipped": "outside_active_hours"}
+
+    if not _in_inbound_dm_burst_window():
+        print("[inbound_dms] outside burst window — skipping")
+        return {"skipped": "outside_burst_window"}
+
+    _snapshot_my_posts(client)
+
+    # --- Send any pending human operator replies first ---
+    try:
+        for pdoc in db.collection("conversations").where(filter=_filter("has_pending_manual_reply", "==", True)).stream():
+            pdata = pdoc.to_dict() or {}
+            phandle = pdata.get("fan_handle", pdoc.id)
+            pending_reply = pdata.get("pending_manual_reply", "")
+            pconvo_id = pdata.get("convo_id")
+            if not pending_reply or not pconvo_id:
+                continue
+            print(f"  [human reply → @{phandle}] {pending_reply[:80]}")
+            if not dry_run:
+                try:
+                    wait = seconds_until_next_write()
+                    if wait > 0:
+                        time.sleep(wait)
+                    check_write("create")
+                    client.send_dm(pconvo_id, pending_reply)
+                    now = datetime.now(timezone.utc).isoformat()
+                    pdoc.reference.update({
+                        "pending_manual_reply": None,
+                        "has_pending_manual_reply": False,
+                        "last_message_at": now,
+                    })
+                    pdoc.reference.collection("messages").add({
+                        "role": "assistant",
+                        "content": pending_reply,
+                        "timestamp": now,
+                    })
+                    print(f"  [human reply sent]")
+                except RateLimitError as e:
+                    print(f"  [rate limit] {e}")
+                except Exception as e:
+                    print(f"  [error] human reply failed for @{phandle}: {e}")
+    except Exception as e:
+        print(f"[warn] pending reply check failed: {e}")
+
     print("[inbound_dms] checking for unread DMs via listConvos...")
 
     unread = []
@@ -511,14 +791,21 @@ def poll_inbound_dms(client, brand_voice, dry_run=False):
         # Classify the fan's message to route to the right generator
         is_subscriber = classify_subscriber_mention(their_message)
         intent = classify_fan_intent(their_message)
+        already_discounted = convo_data.get("discount_sent", False)
 
         discount_sent = None
         try:
             if is_subscriber:
+                # Subscriber guard always wins — warm thanks, no pitch
                 dm_reply = generate_dm_subscriber_reply(handle, their_message, history, brand_voice)
                 new_stage = "subscriber"
+            elif exchange_count == 0 and not already_discounted:
+                # First ever reply to our initiation DM — offer discount immediately regardless of intent
+                discount = _resolve_dm_discount()
+                dm_reply = generate_dm_funnel_reply(handle, their_message, history, brand_voice, discount=discount)
+                discount_sent = discount
+                new_stage = "converted" if discount else "engaged"
             elif intent in ("buying_signal", "curious"):
-                already_discounted = convo_data.get("discount_sent", False)
                 discount = _resolve_dm_discount() if not already_discounted else None
                 dm_reply = generate_dm_funnel_reply(handle, their_message, history, brand_voice, discount=discount)
                 discount_sent = discount
@@ -550,12 +837,26 @@ def poll_inbound_dms(client, brand_voice, dry_run=False):
                 }
                 if discount_sent:
                     update_payload["discount_sent"] = True
+                    update_payload["discount_sent_at"] = now
                 db.collection("conversations").document(handle).update(update_payload)
 
                 dt = datetime.now(timezone.utc)
                 msgs = db.collection("conversations").document(handle).collection("messages")
                 msgs.add({"role": "user", "content": their_message, "timestamp": dt.isoformat()})
                 msgs.add({"role": "assistant", "content": dm_reply, "timestamp": (dt + timedelta(microseconds=1)).isoformat()})
+
+                try:
+                    db.collection("engagement_events").add({
+                        "type": "reply",
+                        "direction": "inbound",
+                        "handle": handle,
+                        "post_uri": None,
+                        "fan_intent": intent,
+                        "created_at": dt.isoformat(),
+                    })
+                except Exception:
+                    pass
+
                 print(f"  [reply sent]")
 
             except RateLimitError as e:

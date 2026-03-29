@@ -1,6 +1,8 @@
 import os
 import re
 import anthropic
+from bluesky.shared.firestore_client import db as _db
+from bluesky.shared.cost_calculator import write_cost_event
 
 _SYSTEM = """You write replies on Bluesky on behalf of the creator described in the brand voice below. \
 Follow §6.4 (Bluesky) rules strictly. Reply with ONLY the reply text — no quotes, no labels, nothing else. \
@@ -250,10 +252,21 @@ def _build_dm_pull_prompt(brand_voice, original_text, reply_text, handle, used_p
 
 def load_brand_voice():
     """
-    Load brand voice text. Two sources (checked in order):
-      1. BRANDVOICE_CONTENT env var — set in Cloud Functions via Secret Manager
-      2. BRANDVOICE_PATH env var  — absolute path, used in local dev
+    Load brand voice text. Three sources (checked in order):
+      1. Firestore _system/brand_voice — pushed via dashboard; freshest version
+      2. BRANDVOICE_CONTENT env var   — set via Secret Manager in Cloud Functions
+      3. BRANDVOICE_PATH env var      — absolute path, used in local dev
+    Firestore is skipped silently on any error (network, missing doc, etc.).
     """
+    try:
+        doc = _db.collection("_system").document("brand_voice").get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            content = data.get("rendered_md") or data.get("content")
+            if content:
+                return content
+    except Exception:
+        pass
     content = os.environ.get("BRANDVOICE_CONTENT")
     if content:
         return content
@@ -270,6 +283,7 @@ def _call(prompt, max_tokens=200):
         system=_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    write_cost_event(_db, message.model, message.usage, "reply_generation")
     return message.content[0].text.strip()
 
 
@@ -281,6 +295,7 @@ def _classify(prompt):
         max_tokens=5,
         messages=[{"role": "user", "content": prompt}],
     )
+    write_cost_event(_db, message.model, message.usage, "intent_classification")
     return message.content[0].text.strip().lower()
 
 
@@ -368,6 +383,31 @@ def generate_reply(original_text, reply_text, handle, brand_voice, nudge=False):
 
 def generate_dm_pull_reply(original_text, reply_text, handle, brand_voice, used_pulls=None, discount=None):
     return _call(_build_dm_pull_prompt(brand_voice, original_text, reply_text, handle, used_pulls, discount))
+
+
+def generate_discount_pull_reply(original_text, reply_text, handle, brand_voice):
+    """
+    Public reply that explicitly mentions a discount and invites the fan to DM.
+    Used after the first nudge exchange in a comment thread (up to 2x per thread).
+    Direction: 'I love giving discounts to fans, DM me.'
+    """
+    prompt = "\n\n".join([
+        brand_voice,
+        "---",
+        f"The creator's original post:\n{original_text}",
+        f"Fan reply from @{handle}:\n{reply_text}",
+        "---",
+        "\n".join([
+            f"Write a warm public reply in the creator's voice to @{handle}.",
+            "The reply should feel genuine and personal, not promotional.",
+            "Mention that you love giving your fans discounts and invite them to DM you for one.",
+            "Direction: 'I love giving discounts to fans, DM me.' — but say it in your natural voice.",
+            "Do NOT include an actual discount code or URL in the public reply — only in DMs.",
+            _emoji_line(reply_text),
+            _word_limit_line(reply_text),
+        ]),
+    ])
+    return _call(prompt)
 
 
 def generate_studio_thanks(original_text, reply_text, handle, brand_voice):

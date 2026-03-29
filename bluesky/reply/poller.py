@@ -11,7 +11,7 @@ import hashlib
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,14 +24,16 @@ import random
 
 from bluesky.shared.bluesky_client import BlueskyClient
 from bluesky.shared.firestore_client import db
-from bluesky.shared.rate_limiter import check_write, seconds_until_next_write, RateLimitError
-from bluesky.engagement.fan_pipeline import queue_dm, send_engagement_dm, poll_inbound_dms
+from bluesky.shared.rate_limiter import check_write, seconds_until_next_write, RateLimitError, is_active_hours
+from bluesky.shared.cost_calculator import write_cost_event
+from bluesky.engagement.fan_pipeline import queue_dm, poll_inbound_dms
 from bluesky.reply.reply_generator import (
     classify_post_type,
     classify_fan_intent,
     classify_subscriber_mention,
     generate_reply,
     generate_dm_pull_reply,
+    generate_discount_pull_reply,
     generate_peer_reply,
     generate_subscriber_thanks,
     generate_studio_thanks,
@@ -41,7 +43,7 @@ from bluesky.reply.reply_generator import (
     PITCH_INTENT,
 )
 from bluesky.reply.state_manager import StateManager
-from bluesky.reply.creator_classifier import classify_user
+from bluesky.reply.creator_classifier import classify_user, bot_score, BOT_SCORE_SKIP
 from bluesky.reply.dm_manager import DMManager
 from bluesky.reply.dm_generator import (
     generate_like_dm,
@@ -75,6 +77,22 @@ def _mark_seen(uri):
         "uri": uri,
         "seen_at": datetime.now(timezone.utc).isoformat(),
     })
+
+
+def _write_engagement_event(event_type, direction, handle, post_uri, **kwargs):
+    """Write one engagement_events doc. Silently no-ops on error."""
+    try:
+        doc = {
+            "type": event_type,
+            "direction": direction,
+            "handle": handle,
+            "post_uri": post_uri,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        doc.update({k: v for k, v in kwargs.items() if v is not None})
+        db.collection("engagement_events").add(doc)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +156,10 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
 
     reply_text = notif.record.text
 
+    # Record inbound fan reply
+    if not dry_run:
+        _write_engagement_event("reply", "inbound", handle, post_uri)
+
     # Classify user type (cached — avoids repeat API calls)
     user_type, follower_count = _classify_user(handle, client, dm_state)
     print(f"  [user type: {user_type}, {follower_count:,} followers]")
@@ -187,6 +209,8 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
         generated = generate_studio_thanks(root_text, reply_text, handle, brand_voice)
         print(f"  → {generated}")
         _post_reply(generated)
+        if not dry_run:
+            _write_engagement_event("reply", "outbound", handle, post_uri, reply_type="studio_reply", user_type="studio")
         return "studio_reply"
 
     # --- Creator: peer register ---
@@ -199,6 +223,8 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
         if len(options) > 1:
             print(f"  [decline options: {len(options)} generated, picked one randomly]")
         _post_reply(generated)
+        if not dry_run:
+            _write_engagement_event("reply", "outbound", handle, post_uri, reply_type="peer_reply", interaction_subtype=peer_intent, user_type="creator")
         return "creator_reply"
 
     parent_uri = notif.record.reply.parent.uri
@@ -229,6 +255,8 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
         generated = generate_themed_reply(root_text, reply_text, handle, brand_voice)
         print(f"  → {generated}")
         _post_reply(generated)
+        if not dry_run:
+            _write_engagement_event("reply", "outbound", handle, post_uri, reply_type="themed_reply", user_type="themed")
         return "themed_reply"
 
     # Subscriber guard — existing members get a warm thank-you, no pitch, no discount
@@ -237,9 +265,12 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
         generated = generate_subscriber_thanks(root_text, reply_text, handle, brand_voice)
         print(f"  → {generated}")
         _post_reply(generated)
+        if not dry_run:
+            _write_engagement_event("reply", "outbound", handle, post_uri, reply_type="subscriber_warmth", user_type="fan")
         return "subscriber_thanks"
 
     post_type = classify_post_type(root_text)
+    intent = None  # set in follow-up branch when fan_intent is classified
 
     print(f"  @{handle}: {reply_text[:100]}")
     print(f"  [post type: {post_type}]")
@@ -262,9 +293,16 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
             action = "fan_dm_pull"
             print("  [dm pull]")
         else:
-            # Keep nudging — fan hasn't shown buying signal yet
-            generated = generate_reply(parent_text, reply_text, handle, brand_voice, nudge=True)
-            action = "fan_nudge"
+            # After first nudge reply: use discount pull (up to 2x per thread),
+            # then fall back to regular nudge.
+            dm_pulls_count = len(state.get_dm_pulls(root_uri))
+            if dm_pulls_count < 2:
+                generated = generate_discount_pull_reply(root_text, reply_text, handle, brand_voice)
+                action = "fan_discount_pull"
+                print("  [discount pull]")
+            else:
+                generated = generate_reply(parent_text, reply_text, handle, brand_voice, nudge=True)
+                action = "fan_nudge"
 
     else:
         # First reply to Sean's post — start the conversation with a nudging question
@@ -319,8 +357,25 @@ def _handle_reply(notif, client, state, dm_state, brand_voice, dry_run):
                         "last_message_at": now,
                         "last_fan_message": None,
                     }, merge=True)
+                elif action == "fan_discount_pull":
+                    state.add_dm_pull(root_uri, generated)
+                    # Queue a proactive DM to this commenter — executor handles dedup
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    fan_did = getattr(notif.author, "did", None) or ""
+                    queue_dm(
+                        handle, fan_did, "comment_exchange", root_text, "fan",
+                        interaction_at=now_iso,
+                    )
+                    print(f"  [queued comment_exchange DM → @{handle}]")
                 else:
                     state.increment_depth(root_uri)
+            _write_engagement_event(
+                "reply", "outbound", handle, root_uri,
+                reply_type=action,
+                post_type_classification=post_type,
+                fan_intent=intent if action in ("fan_dm_pull", "fan_discount_pull") else None,
+                user_type="fan",
+            )
             print("  [posted]")
             return action
         except RateLimitError as e:
@@ -340,10 +395,11 @@ def _dry_run_simulate(handle, sean_reply, original_text, brand_voice, root_uri, 
     print(f"  [sim] → DM pull: {dm_pull}")
 
 
-def _handle_engagement(notif, interaction_type, client, dm_state, state, brand_voice, dry_run):
+def _handle_engagement(notif, interaction_type, client, dm_state, state, dry_run):
     """
-    Handle a like or repost notification by sending a DM immediately.
-    Follows are still queued via queue_dm / process_dm_queue.
+    Handle a like or repost notification by queuing a DM.
+    Gated by: 1hr post age, active hours, bot scorer (fans only).
+    Follows are handled separately via _handle_follow → queue_dm / process_dm_queue.
     """
     handle = notif.author.handle
     post_uri = getattr(notif, "reason_subject", None)
@@ -361,31 +417,52 @@ def _handle_engagement(notif, interaction_type, client, dm_state, state, brand_v
         print(f"  [skip] {user_type} like — only DM fans for likes")
         return
 
-    # Fetch profile for eligibility check
+    # Fetch profile for bot detection (fans) and DID
     try:
         profile = client.get_profile(handle)
     except Exception as e:
         print(f"  [warn] could not fetch profile for @{handle}: {e}")
         return
 
-    eligible, reason = _is_eligible_for_dm(profile)
-    if not eligible:
-        print(f"  [skip] @{handle} ineligible: {reason}")
-        return
+    # Bot scorer — applies to fan-type accounts only
+    if user_type == "fan":
+        score = bot_score(profile)
+        if score >= BOT_SCORE_SKIP:
+            print(f"  [skip] @{handle} bot score {score} ≥ {BOT_SCORE_SKIP}")
+            return
 
-    # Fetch post context
+    # Fetch post for context + 1hr age gate (same API call — created_at on record)
     post_context = ""
+    post_created_at = None
     if post_uri:
         try:
-            post_context = client.get_post(post_uri).record.text
+            post = client.get_post(post_uri)
+            post_context = post.record.text
+            post_created_at = getattr(post.record, "created_at", None)
         except Exception:
             pass
 
-    # Send immediately — fan is active right now
-    send_engagement_dm(
-        client, handle, profile.did, interaction_type,
-        post_context, user_type, brand_voice, dry_run=dry_run,
+    # 1hr post age gate — only queue DMs for engagements on recent posts
+    if post_created_at:
+        try:
+            post_dt = datetime.fromisoformat(post_created_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - post_dt > timedelta(hours=1):
+                print(f"  [skip] post >1hr old — not queueing DM")
+                return
+        except Exception:
+            pass
+
+    if dry_run:
+        print(f"  [dry-run] would queue DM to @{handle} ({interaction_type})")
+        return
+
+    # Queue DM — send_engagement_dm() called later by execute-engagement-dms CF
+    queue_dm(
+        handle, profile.did, interaction_type, post_context, user_type,
+        interaction_at=notif.indexed_at,
+        post_created_at=post_created_at,
     )
+    _write_engagement_event("engagement_queued", "inbound", handle, post_uri, user_type=user_type)
 
 
 def _handle_follow(notif, client, dm_state, state, brand_voice, dry_run):
@@ -411,6 +488,7 @@ def _handle_follow(notif, client, dm_state, state, brand_voice, dry_run):
         return
 
     queue_dm(handle, profile.did, "follow", "", user_type)
+    _write_engagement_event("follow", "inbound", handle, None, user_type=user_type)
 
 
 def run_once(client, state, brand_voice, dry_run, dm_state=None):
@@ -419,6 +497,7 @@ def run_once(client, state, brand_voice, dry_run, dm_state=None):
         "fan_nudge": 0,
         "fan_casual": 0,
         "fan_dm_pull": 0,
+        "fan_discount_pull": 0,
         "creator_reply": 0,
         "studio_reply": 0,
         "themed_reply": 0,
@@ -430,6 +509,10 @@ def run_once(client, state, brand_voice, dry_run, dm_state=None):
         "dms_queued": 0,
     }
 
+    if not is_active_hours():
+        print("[poll] outside active hours (7am–10pm Pacific) — skipping cycle")
+        return metrics
+
     if state.get_status() == "paused":
         print("[paused] bot is paused, skipping cycle")
         metrics["skipped_paused"] = -1   # sentinel: whole cycle paused
@@ -439,11 +522,24 @@ def run_once(client, state, brand_voice, dry_run, dm_state=None):
     notifications = client.get_reply_notifications()
     print(f"[poll] {len(notifications)} reply notification(s)")
 
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
     for notif in notifications:
         if _is_seen(notif.uri):
             continue
+        notif_time = datetime.fromisoformat(notif.indexed_at.replace("Z", "+00:00"))
+        if notif_time < cutoff:
+            handle = notif.author.handle
+            try:
+                has_convo = db.collection("conversations").document(handle).get().exists
+            except Exception:
+                has_convo = False
+            if not has_convo:
+                print(f"  [skip] too old ({notif.indexed_at[:10]}) — @{handle}")
+                _mark_seen(notif.uri)
+                continue
+            print(f"  [keep] too old but active conversation — @{handle}")
         metrics["notifications_seen"] += 1
-        print(f"\n[notif] {notif.uri}")
+        print(f"\n[notif] {notif.uri} ({notif.indexed_at[:10]})")
         try:
             action = _handle_reply(notif, client, state, dm_state, brand_voice, dry_run)
             if action:
@@ -467,7 +563,7 @@ def run_once(client, state, brand_voice, dry_run, dm_state=None):
                 if notif.reason == "follow":
                     _handle_follow(notif, client, dm_state, state, brand_voice, dry_run)
                 else:
-                    _handle_engagement(notif, notif.reason, client, dm_state, state, brand_voice, dry_run)
+                    _handle_engagement(notif, notif.reason, client, dm_state, state, dry_run)
                 metrics["dms_queued"] += 1
             except Exception as e:
                 print(f"  [error] {e}")

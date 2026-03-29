@@ -47,7 +47,7 @@ class BlueskyClient:
             session_str = (doc.to_dict() or {}).get("session_string", "")
             if session_str:
                 try:
-                    self._client.import_session_string(session_str)
+                    self._client._import_session_string(session_str)
                     self._my_did = self._client.me.did
                     restored = True
                     print("[auth] session restored from Firestore")
@@ -218,11 +218,12 @@ class BlueskyClient:
 
     # --- Discovery methods ---
 
-    def get_author_feed(self, actor, limit=10):
-        """Fetch recent posts by actor. Returns raw response with .feed (list of FeedViewPost)."""
-        return self._client.app.bsky.feed.get_author_feed(
-            params={"actor": actor, "limit": limit, "filter": "posts_no_replies"}
-        )
+    def get_author_feed(self, actor, limit=10, cursor=None):
+        """Fetch recent posts by actor. Returns raw response with .feed (list of FeedViewPost) and .cursor."""
+        params = {"actor": actor, "limit": limit, "filter": "posts_no_replies"}
+        if cursor:
+            params["cursor"] = cursor
+        return self._client.app.bsky.feed.get_author_feed(params=params)
 
     def get_followers_page(self, actor, limit=100, cursor=None):
         """

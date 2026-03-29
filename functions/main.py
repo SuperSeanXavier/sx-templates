@@ -158,6 +158,37 @@ def execute_comment(request):
 
 
 # ---------------------------------------------------------------------------
+# execute-engagement-dms   (every 5 min)
+# ---------------------------------------------------------------------------
+
+@functions_framework.http
+def execute_engagement_dms(request):
+    """
+    Drain the like/repost/comment_exchange DM queue.
+    Only sends DMs for engagements within the last 1hr (recency gate).
+    Uses the DM-specific 60s write window, independent of the 4-min public write window.
+    """
+    from bluesky.engagement.fan_pipeline import execute_engagement_dm_queue as _exec
+
+    body = request.get_json(silent=True) or {}
+    batch_size = int(body.get("batch_size", 10))
+
+    start = time.time()
+    metrics = {}
+    err = None
+    try:
+        client = _client()
+        brand_voice = _brand_voice()
+        metrics = _exec(client, brand_voice, batch_size=batch_size) or {}
+    except Exception as e:
+        err = e
+        raise
+    finally:
+        _log("execute-engagement-dms", metrics, start, err)
+    return ("OK", 200)
+
+
+# ---------------------------------------------------------------------------
 # process-dm-queue   (every 2 hours)
 # ---------------------------------------------------------------------------
 
@@ -185,10 +216,10 @@ def process_dm_queue(request):
 
 @functions_framework.http
 def execute_dm_batch(request):
-    """Dequeue up to 7 pending DMs, generate, and send with stagger.
+    """Dequeue up to 10 follow DMs, generate, and send with stagger.
 
-    batch_size=7: with 8-min minimum stagger per send, 7 items fits within the
-    3600s function timeout (7 × 480s = 3360s). Items not sent remain pending
+    batch_size=10: with 5-min minimum stagger per send, 10 items fits within the
+    3600s function timeout (10 × 300s = 3000s). Items not sent remain pending
     and are picked up on the next 4-hour invocation.
 
     Accepts optional JSON body: {"batch_size": N} to override the default.
@@ -197,7 +228,7 @@ def execute_dm_batch(request):
     from bluesky.engagement.fan_pipeline import process_dm_queue as _process
 
     body = request.get_json(silent=True) or {}
-    batch_size = int(body.get("batch_size", 7))
+    batch_size = int(body.get("batch_size", 10))
 
     start = time.time()
     metrics = {}
@@ -435,4 +466,46 @@ def cleanup_stale_docs(request):
             "deleted_function_runs": del_runs,
             "total_deleted": del_seen + del_dm + del_comment + del_runs,
         }, start, err)
+    return ("OK", 200)
+
+
+# ---------------------------------------------------------------------------
+# snapshot-follower-count   (nightly 2am — before follower-graph-slot-0)
+# ---------------------------------------------------------------------------
+
+@functions_framework.http
+def snapshot_follower_count(request):
+    """
+    Write a daily follower count snapshot to _system/follower_snapshots.
+    Powers the Audience growth chart on the dashboard.
+    Each doc: { date: "YYYY-MM-DD", count: N, snapshot_at: ISO }
+    Idempotent — overwrites the doc for today's date if already present.
+    """
+    from datetime import datetime, timezone
+    from bluesky.shared.firestore_client import db
+
+    start = time.time()
+    metrics = {}
+    err = None
+    try:
+        client = _client()
+        profile = client.get_profile(os.environ["BLUESKY_HANDLE"])
+        count = getattr(profile, "followers_count", 0) or 0
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        db.collection("_system").document("follower_snapshots") \
+          .collection("daily").document(today).set({
+            "date": today,
+            "count": count,
+            "snapshot_at": now_iso,
+        })
+
+        metrics = {"date": today, "follower_count": count}
+        print(f"[snapshot] {today}: {count:,} followers")
+    except Exception as e:
+        err = e
+        raise
+    finally:
+        _log("snapshot-follower-count", metrics, start, err)
     return ("OK", 200)

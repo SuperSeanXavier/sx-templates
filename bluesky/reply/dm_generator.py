@@ -20,6 +20,8 @@ replied in the DM thread, the message thanks them AND picks up where they left o
 import json
 import os
 import anthropic
+from bluesky.shared.firestore_client import db as _db
+from bluesky.shared.cost_calculator import write_cost_event
 
 _SYSTEM = """You write direct messages on Bluesky on behalf of the creator described \
 in the brand voice below. Write ONLY the DM text — no quotes, no labels, nothing else. \
@@ -104,6 +106,7 @@ def _call(system, prompt):
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
+    write_cost_event(_db, message.model, message.usage, "dm_generation")
     return message.content[0].text.strip()
 
 
@@ -278,6 +281,7 @@ def _score_thread_signal(fan_messages: list) -> tuple:
             max_tokens=60,
             messages=[{"role": "user", "content": _CLASSIFY_SIGNAL_PROMPT.format(messages=combined)}],
         )
+        write_cost_event(_db, result.model, result.usage, "intent_classification")
         raw = result.content[0].text.strip()
         # Strip markdown code fences if present
         if raw.startswith("```"):

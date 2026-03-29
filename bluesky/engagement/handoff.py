@@ -20,6 +20,7 @@ import re
 import anthropic
 
 from bluesky.shared.firestore_client import db
+from bluesky.shared.cost_calculator import write_cost_event
 
 # ---------------------------------------------------------------------------
 # Keyword patterns for fast local detection (no API call)
@@ -87,6 +88,7 @@ def _semantic_real_person_check(message_text):
             ),
         }],
     )
+    write_cost_event(db, result.model, result.usage, "intent_classification")
     answer = result.content[0].text.strip().upper()
     return answer.startswith("YES")
 
@@ -112,7 +114,7 @@ def check_handoff_triggers(message_text, exchange_count, ai_confidence=None):
         return True, "low_ai_confidence"
 
     # Trigger 4: conversation too long
-    if exchange_count >= 8:
+    if exchange_count >= 10:
         return True, "max_exchanges"
 
     # Trigger 3: distress or abusive content

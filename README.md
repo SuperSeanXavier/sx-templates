@@ -289,7 +289,7 @@ bash scheduler.sh   # creates/updates all Cloud Scheduler jobs
 
 **Human handoff** is triggered automatically when a fan's DM conversation warrants a human response (e.g. complaints, complex questions, payment issues). When the flag is set, automated replies are silenced for that handle and the conversation is left unread in the Bluesky app for a human operator.
 
-To resume automated replies after handling the conversation:
+Handoff queue and resolution are managed from the web dashboard (Module D) or via CLI:
 ```bash
 python bluesky/reply/admin.py clear-handoff @handle
 ```
@@ -338,6 +338,16 @@ python bluesky/reply/admin.py clear-handoff @handle
 | `functions/main.py` | HTTP-triggered entry points for all 11 Cloud Functions |
 | `deploy.sh` | Deploy all functions via `gcloud` |
 | `scheduler.sh` | Create/update all Cloud Scheduler jobs |
+
+**Web dashboard**
+
+| Path | Purpose |
+|---|---|
+| `bluesky/web/dashboard.html` | Single-page app — all dashboard pages in one file |
+| `bluesky/web/api/main.py` | FastAPI backend — 32 endpoints, deployed to Cloud Run |
+| `bluesky/web/api/requirements.txt` | Backend dependencies |
+| `bluesky/web/Dockerfile` | Cloud Run container for the FastAPI backend |
+| `firebase.json` / `.firebaserc` | Firebase Hosting config — serves `dashboard.html` |
 
 **Brand voice**
 
@@ -397,13 +407,15 @@ Override file locations with `STATE_PATH` and `DM_STATE_PATH` env vars. In Cloud
 | `target_accounts` | Ranked anchor accounts by domain and tier (1–3) |
 | `engagement_events` | Raw notification log — reply, like, repost, follow |
 | `dm_queue` | Outbound DMs awaiting batch send (follows only) |
-| `conversations` | Per-fan DM thread state — stage, handoff flag, one-outreach-per-handle guard |
+| `conversations` | Per-fan DM thread state — stage, handoff flag, trigger context, one-outreach-per-handle guard, `pending_manual_reply` for dashboard-queued messages |
 | `messages` | Full message history per conversation (subcollection of `conversations`) |
 | `comment_queue` | Generated comments awaiting posting |
 | `seen_events` | Notification URI dedup log (cleaned up weekly) |
+| `api_cost_events` | Per-Claude-call cost log — model, token counts, cost_usd, call_type (cleaned up after 90 days) |
 | `_system/bluesky_session` | Persisted atproto session string — avoids `createSession` quota |
 | `_system/rate_state` | Global write window state shared across all Cloud Functions |
 | `_system/activity_log` | Per-function run metrics |
+| `_system/brand_voice` | Firestore-stored brand voice doc — read by bot first; falls back to `BRANDVOICE_CONTENT` env var then `BRANDVOICE_PATH` file |
 
 **Session persistence:** `BlueskyClient.login()` stores the atproto session in Firestore after every login and restores it on the next invocation. The SDK auto-refreshes the access token (~2hr lifetime) using the stored refresh token (~90 days). A full `createSession` only fires on first run or after ~90-day expiry — well within the 300/day quota.
 
@@ -415,3 +427,88 @@ The Bluesky API enforces a global write rate limit across all your Cloud Functio
 - **Writes** are tracked in Firestore `_system/rate_state` — a global 4-minute window shared across all Cloud Functions
 
 All three write paths — `post_reply()`, DM sends, and comment posts — call `check_write()` before executing. If the window is not clear, `seconds_until_next_write()` returns the wait time and the function exits early; the item remains queued for the next invocation.
+
+---
+
+## Module D — Web Dashboard
+
+A single-page dashboard for monitoring and managing the engagement system. Deployed as a Firebase-hosted SPA (`dashboard.html`) backed by a FastAPI service on Cloud Run.
+
+### What It Shows
+
+| Page | Contents |
+|---|---|
+| **Dashboard** | Conversion chart, DM engagement & effectiveness, engagement heatmap, human handoff queue, tone review, activity feed, caps/spend summary |
+| **Content** | Post performance — replies, DM pulls, intent rate per post |
+| **Tone review** | Sample and edge-case replies surfaced for approval or flagging |
+| **Activity** | Full engagement event feed with type filters (replies, DMs, comments, flags, paused, discounts) |
+| **Brand voice** | Live editor for the Firestore-stored brand voice doc |
+| **Spend** | API cost breakdown by model and call type, raw event log |
+| **Settings** | Bot caps, detection flags, discount config |
+
+### User Activity Lookup
+
+A `look up @handle…` input on both the dashboard Activity Feed card and the Activity page provides typeahead search across all handles with logged activity. Selecting a handle opens a modal showing:
+
+- Engagement history (event type + timestamp from `engagement_events`)
+- Full message thread (bot / fan / operator bubbles from `messages` subcollection)
+- A send box to queue a manual reply — delivered on the next `poll_inbound_dms` cycle via `pending_manual_reply`
+
+### Human Handoff Queue
+
+Conversations flagged for human review appear in the HHQ card. Click any item to open the resolution modal — enter a reply, set bot resume behavior, and remove from or keep in the queue. Handoff cases can also be opened by searching any handle via the User Activity lookup.
+
+CLI fallback: `python bluesky/reply/admin.py clear-handoff @handle`
+
+### D1. Local Dev
+
+```bash
+# Start the FastAPI backend (run from project root)
+uvicorn bluesky.web.api.main:app --reload --port 8000
+
+# Open the SPA directly in your browser
+open bluesky/web/dashboard.html
+```
+
+On first load, set your dashboard secret in the browser console:
+```js
+localStorage.setItem('dash_secret', 'your-DASHBOARD_SECRET-value')
+```
+
+The `API_BASE` auto-detects `file://` / `localhost` and points to `http://localhost:8000`. Do not set `api_base` in localStorage — remove it if present.
+
+### D2. Deploy
+
+```bash
+# Build and push the dashboard API image via Cloud Build
+gcloud builds submit \
+  --config /tmp/cloudbuild-dashboard.yaml \
+  --project=YOUR_PROJECT_ID .
+
+# Deploy FastAPI to Cloud Run
+gcloud run deploy sx-dashboard-api \
+  --image="gcr.io/YOUR_PROJECT_ID/sx-dashboard-api" \
+  --region=us-central1 --platform=managed \
+  --set-secrets="DASHBOARD_SECRET=dashboard-secret:latest,ANTHROPIC_API_KEY=anthropic-api-key:latest,BRANDVOICE_CONTENT=brandvoice-content:latest" \
+  --set-env-vars="GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID,FIRESTORE_DATABASE=YOUR_DATABASE_NAME" \
+  --project=YOUR_PROJECT_ID
+
+# Allow public access
+gcloud run services update sx-dashboard-api \
+  --region=us-central1 --project=YOUR_PROJECT_ID --no-invoker-iam-check
+
+# Deploy the SPA to Firebase Hosting
+firebase deploy --only hosting --account your@email.com
+```
+
+**Required secrets** (add to Secret Manager before deploying):
+```bash
+gcloud secrets create dashboard-secret --replication-policy automatic
+echo -n "your-secret" | gcloud secrets versions add dashboard-secret --data-file=-
+```
+
+**Required env var:**
+```
+DASHBOARD_SECRET=    # Bearer token for all API endpoints
+```
+

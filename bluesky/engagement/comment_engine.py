@@ -22,6 +22,7 @@ import anthropic
 
 from google.cloud.firestore_v1.base_query import FieldFilter as _filter
 from bluesky.shared.firestore_client import db
+from bluesky.shared.cost_calculator import write_cost_event
 from bluesky.shared.rate_limiter import (
     check_read, check_write, seconds_until_next_write, RateLimitError,
 )
@@ -86,6 +87,7 @@ def _generate_comment(target_handle, post_text, brand_voice, domains=None):
         system=_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    write_cost_event(db, message.model, message.usage, "comment_generation")
     return message.content[0].text.strip()
 
 
@@ -357,6 +359,18 @@ def execute_comment_queue(client, brand_voice, dry_run=False):
             "status": "posted",
             "posted_at": now,
         })
+        try:
+            db.collection("engagement_events").add({
+                "type": "comment",
+                "direction": "outbound",
+                "handle": handle,
+                "post_uri": item["post_uri"],
+                "reply_type": "comment",
+                "interaction_subtype": "tier_1_comment" if item.get("tier") == 1 else "tier_2_comment",
+                "created_at": now,
+            })
+        except Exception:
+            pass
         print(f"  [posted] ({posted_today + 1}/{DAILY_COMMENT_CAP} today)")
         return {
             "outcome": "posted",
