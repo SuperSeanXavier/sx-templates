@@ -12,6 +12,7 @@ import random
 import sys
 import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -540,7 +541,10 @@ def get_errors():
 def get_caps():
     settings = _load_settings()
     caps = settings.get("caps", {})
-    today = _utc_now().date().isoformat()
+    now_pt = datetime.now(_PT)
+    today = now_pt.date().isoformat()
+    # Start of today in PT expressed as UTC ISO string — used for timestamp comparisons
+    today_pt_start = datetime(now_pt.year, now_pt.month, now_pt.day, tzinfo=_PT).astimezone(timezone.utc).isoformat()
 
     comments_today = 0
     dms_today = 0
@@ -570,9 +574,9 @@ def get_caps():
 
     try:
         docs = (
-            db.collection("engagement_events")
-            .where(filter=_FF("interaction_subtype", "==", "discount_sent"))
-            .where(filter=_FF("created_at", ">=", today))
+            db.collection("conversations")
+            .where(filter=_FF("discount_sent", "==", True))
+            .where(filter=_FF("discount_sent_at", ">=", today_pt_start))
             .stream()
         )
         discounts_today = sum(1 for _ in docs)
@@ -591,9 +595,9 @@ def get_caps():
             "remaining": max(0, caps.get("max_dm_outreach_per_day", 50) - dms_today),
         },
         "discounts": {
-            "cap": caps.get("max_discounts_per_day", 5),
+            "cap": None,
             "used": discounts_today,
-            "remaining": max(0, caps.get("max_discounts_per_day", 5) - discounts_today),
+            "remaining": None,
         },
     }
 
@@ -792,7 +796,7 @@ def get_funnel_snapshot(period: str = "Mon", range: str = "7d"):
 
     return {
         "period": period,
-        "fan_replies": sum(1 for e in events if e.get("type") == "reply" and e.get("direction") == "inbound"),
+        "fan_replies": sum(1 for e in events if e.get("type") == "reply" and e.get("direction") == "outbound"),
         "nudge_sent": sum(1 for e in events if e.get("reply_type") == "nudge"),
         "intent_signal": sum(1 for e in events if e.get("direction") == "inbound" and e.get("fan_intent") in ("buying_signal", "curious")),
         "dm_pull": sum(1 for e in events if e.get("reply_type") == "dm_pull"),
@@ -982,7 +986,7 @@ def get_dm_effectiveness(range: str = "7d", period: Optional[str] = None):
         convos = [
             d.to_dict()
             for d in db.collection("conversations")
-            .where(filter=_FF("created_at", ">=", start_iso))
+            .where(filter=_FF("last_message_at", ">=", start_iso))
             .stream()
         ]
     except Exception:
@@ -1051,35 +1055,40 @@ def get_dm_effectiveness(range: str = "7d", period: Optional[str] = None):
 
 
 @app.get("/api/heatmap", dependencies=[_AUTH])
-def get_heatmap(mode: str = "replies"):
-    now = _utc_now()
-    start_dt = now - timedelta(days=7)
+def get_heatmap(mode: str = "replies", tz_offset: int = 0):
+    # tz_offset = minutes west of UTC (JS getTimezoneOffset): PDT=420, EST=300
+    local_offset = timedelta(minutes=-tz_offset)
+    now_local = _utc_now() + local_offset
+    start_local = (now_local - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
     grid = [[0] * 24 for _ in range(7)]
 
+    # Query with UTC equivalent of local window start
+    start_utc = start_local - local_offset
     try:
         events = [
             d.to_dict()
             for d in db.collection("engagement_events")
-            .where(filter=_FF("created_at", ">=", start_dt.isoformat()))
+            .where(filter=_FF("created_at", ">=", start_utc.isoformat()))
             .stream()
         ]
     except Exception:
         events = []
 
     for e in events:
-        if mode in ("replies", "engagement") and not (e.get("type") == "reply" and e.get("direction") == "inbound"):
+        if mode == "dm_engagement" and not (e.get("type") == "dm" and e.get("direction") == "inbound"):
             continue
-        if mode == "dms" and not (e.get("type") == "dm" and e.get("direction") == "outbound"):
+        if mode == "post_engagement" and not (e.get("direction") == "inbound" and e.get("type") in ("like", "repost", "reply", "engagement_queued")):
             continue
         try:
-            dt = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
-            day_idx = (dt.date() - start_dt.date()).days
+            dt_utc = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
+            dt_local = dt_utc + local_offset
+            day_idx = (dt_local.date() - start_local.date()).days
             if 0 <= day_idx < 7:
-                grid[day_idx][dt.hour] += 1
+                grid[day_idx][dt_local.hour] += 1
         except Exception:
             pass
 
-    days = [(start_dt + timedelta(days=i)).strftime("%a") for i in range(7)]
+    days = [(start_local + timedelta(days=i)).strftime("%a") for i in range(7)]
     return {"mode": mode, "days": days, "hours": list(range(24)), "grid": grid}
 
 
@@ -1314,11 +1323,159 @@ async def post_tone_feedback(item_id: str, request: Request):
         )
         fb["last_session_at"] = now_iso
         fb_ref.set(fb)
-        fb_ref.collection("records").add({"item_id": item_id, "action": action, "at": now_iso})
+        record: dict = {"item_id": item_id, "action": action, "at": now_iso}
+        for field in ("approved_text", "fan_message", "vehicle", "interaction_type", "fan_intent"):
+            val = body.get(field)
+            if val:
+                record[field] = val
+        fb_ref.collection("records").add(record)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"item_id": item_id, "action": action, "recorded_at": now_iso}
+
+
+@app.post("/api/tone-review/{item_id}/discuss", dependencies=[_AUTH])
+async def post_tone_discuss(item_id: str, request: Request):
+    body = await request.json()
+    message = body.get("message", "").strip()
+    history = body.get("history", [])   # [{role, content}]
+    item = body.get("item", {})
+
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+
+    # Load brand voice
+    bv_md = ""
+    try:
+        bv_doc = db.collection("_system").document("brand_voice").get()
+        if bv_doc.exists:
+            bv_md = render_brand_voice_md(bv_doc.to_dict() or {})
+    except Exception:
+        pass
+    if not bv_md:
+        path = os.getenv("BRANDVOICE_PATH")
+        if path:
+            try:
+                with open(path) as f:
+                    bv_md = f.read()
+            except Exception:
+                pass
+
+    vehicle = item.get("vehicle", "reply")
+    interaction = item.get("interaction_type") or item.get("interaction", "")
+    handle = item.get("handle", "unknown")
+    fan_msg = item.get("fan_message") or item.get("fan", "")
+    bot_reply = item.get("bot_reply") or item.get("bot", "")
+    cls = item.get("classification") or {}
+    surface = item.get("surface_reason") or item.get("surface", "sample")
+
+    system_prompt = f"""You are a brand voice coach helping a creator review bot-generated messages.
+
+Brand voice:
+{bv_md}
+
+Item under review:
+- Vehicle: {vehicle}
+- Interaction type: {interaction}
+- Handle: {handle}
+- Surface reason: {surface}
+- Fan message/action: {fan_msg}
+- Bot reply: {bot_reply}
+- Post type: {cls.get("post_type", "—")}
+- Fan intent: {cls.get("fan_intent", "—")}
+- Mirror tier: {cls.get("mirror_tier", "—")}
+
+Assess the tone concisely. If the creator flags an issue, provide 1-2 alternative draft replies.
+Respond in JSON only: {{"reply": "your assessment", "drafts": ["draft1"]}}
+drafts may be an empty array."""
+
+    messages = [{"role": m["role"], "content": m["content"]} for m in history if m.get("role") in ("user", "assistant")]
+    messages.append({"role": "user", "content": message})
+
+    try:
+        client = _anthropic.Anthropic()
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system_prompt,
+            messages=messages,
+        )
+        write_cost_event(db, resp.model, resp.usage, "tone_discuss")
+        raw = resp.content[0].text.strip().strip("`").removeprefix("json").strip()
+        try:
+            parsed = json.loads(raw)
+            reply_text = parsed.get("reply", raw)
+            drafts = parsed.get("drafts", [])
+        except Exception:
+            reply_text = raw
+            drafts = []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"reply": reply_text, "drafts": drafts}
+
+
+@app.get("/api/tone-review/approved-examples", dependencies=[_AUTH])
+def get_approved_examples_endpoint():
+    try:
+        docs = list(
+            db.collection("_system").document("tone_review_feedback")
+            .collection("records")
+            .order_by("at", direction="DESCENDING")
+            .limit(200)
+            .stream()
+        )
+    except Exception:
+        docs = []
+    examples = []
+    for d in docs:
+        r = d.to_dict() or {}
+        if r.get("action") == "approve" and r.get("approved_text") and r.get("fan_message"):
+            examples.append({
+                "id": d.id,
+                "vehicle": r.get("vehicle", ""),
+                "interaction_type": r.get("interaction_type", ""),
+                "fan_intent": r.get("fan_intent"),
+                "fan_message": r.get("fan_message", ""),
+                "approved_text": r.get("approved_text", ""),
+                "at": r.get("at", ""),
+            })
+    return {"examples": examples}
+
+
+@app.patch("/api/tone-review/approved-examples/{record_id}", dependencies=[_AUTH])
+async def patch_approved_example(record_id: str, request: Request):
+    body = await request.json()
+    approved_text = body.get("approved_text", "").strip()
+    if not approved_text:
+        raise HTTPException(status_code=400, detail="approved_text required")
+    ref = (
+        db.collection("_system")
+        .document("tone_review_feedback")
+        .collection("records")
+        .document(record_id)
+    )
+    doc = ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Record not found")
+    ref.update({"approved_text": approved_text})
+    return {"id": record_id, "approved_text": approved_text}
+
+
+@app.delete("/api/tone-review/approved-examples/{record_id}", dependencies=[_AUTH])
+def delete_approved_example(record_id: str):
+    ref = (
+        db.collection("_system")
+        .document("tone_review_feedback")
+        .collection("records")
+        .document(record_id)
+    )
+    doc = ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Record not found")
+    ref.delete()
+    return {"id": record_id, "deleted": True}
 
 
 @app.post("/api/tone-review/refresh", dependencies=[_AUTH])
@@ -1328,28 +1485,106 @@ def post_tone_refresh():
     items = []
     seen_combos: set = set()
 
+    # --- Pass 1: conversations messages subcollection (primary source) ---
     try:
-        docs = list(
-            db.collection("engagement_events")
-            .where(filter=_FF("created_at", ">=", week_ago))
-            .order_by("created_at", direction="DESCENDING")
-            .limit(500)
+        convo_docs = list(
+            db.collection("conversations")
+            .where(filter=_FF("last_message_at", ">=", week_ago))
+            .limit(100)
             .stream()
         )
-        events = [{"id": d.id, **d.to_dict()} for d in docs]
-    except Exception:
-        events = []
+    except Exception as e:
+        print(f"[tone_refresh] conversations query error: {e}")
+        convo_docs = []
 
-    for e in events:
-        reply_type = e.get("reply_type")
-        vehicle = _event_vehicle(e)
-        if not vehicle or not reply_type:
+    # Sort most-recently-active first
+    convo_docs = sorted(
+        convo_docs,
+        key=lambda d: (d.to_dict() or {}).get("last_message_at", ""),
+        reverse=True,
+    )
+
+    for cdoc in convo_docs:
+        if len(items) >= 50:
+            break
+        cdata = cdoc.to_dict() or {}
+        handle = cdata.get("fan_handle") or cdoc.id
+        trigger = cdata.get("trigger_context", "other")
+
+        try:
+            msg_docs = list(
+                db.collection("conversations").document(cdoc.id)
+                .collection("messages")
+                .stream()
+            )
+        except Exception:
             continue
 
-        combo = (vehicle, reply_type)
+        msgs = sorted(
+            [m.to_dict() for m in msg_docs if m.to_dict()],
+            key=lambda m: m.get("timestamp", ""),
+        )
+
+        # Find the most recent user → assistant pair
+        pair = None
+        for i in range(len(msgs) - 1, 0, -1):
+            if msgs[i].get("role") == "assistant" and msgs[i - 1].get("role") == "user":
+                pair = (msgs[i - 1].get("content", ""), msgs[i].get("content", ""))
+                break
+
+        if not pair or not pair[1]:
+            continue
+
+        fan_msg, bot_reply = pair
+        subtype = f"{trigger}_trigger" if trigger in ("like", "repost", "follow") else trigger
+        combo = ("DM", subtype)
         is_edge = combo not in seen_combos
         seen_combos.add(combo)
 
+        items.append({
+            "id": cdoc.id,
+            "vehicle": "DM",
+            "interaction_type": subtype,
+            "surface_reason": "edge_case" if is_edge else "sample",
+            "handle": f"@{handle.lstrip('@')}",
+            "fan_message": fan_msg,
+            "bot_reply": bot_reply,
+            "classification": {
+                "post_type": None,
+                "fan_intent": cdata.get("stage"),
+                "mirror_tier": None,
+                "interaction": trigger,
+            },
+            "created_at": cdata.get("last_message_at"),
+        })
+
+    # --- Pass 2: engagement_events with bot_reply (public replies, future DM events) ---
+    try:
+        reply_docs = list(
+            db.collection("engagement_events")
+            .where(filter=_FF("created_at", ">=", week_ago))
+            .limit(500)
+            .stream()
+        )
+        reply_events = sorted(
+            [{"id": d.id, **d.to_dict()} for d in reply_docs],
+            key=lambda e: e.get("created_at", ""),
+            reverse=True,
+        )
+    except Exception as e:
+        print(f"[tone_refresh] engagement_events query error: {e}")
+        reply_events = []
+
+    for e in reply_events:
+        if len(items) >= 50:
+            break
+        reply_type = e.get("reply_type")
+        vehicle = _event_vehicle(e)
+        if not vehicle or not reply_type or not e.get("bot_reply"):
+            continue
+        combo = (vehicle, reply_type)
+        is_edge = combo not in seen_combos
+        seen_combos.add(combo)
         items.append({
             "id": e["id"],
             "vehicle": vehicle,
@@ -1366,8 +1601,6 @@ def post_tone_refresh():
             },
             "created_at": e.get("created_at"),
         })
-        if len(items) >= 50:
-            break
 
     try:
         db.collection("_system").document("tone_review_queue").set({
@@ -1616,35 +1849,123 @@ def get_insights(range: str = "24h"):
 # ---------------------------------------------------------------------------
 
 
+def _load_post_cache() -> dict:
+    try:
+        doc = db.document("_system/post_cache").get()
+        if doc.exists:
+            return doc.to_dict().get("cache", {})
+    except Exception:
+        pass
+    return {}
+
+
+def _save_post_cache(cache: dict):
+    try:
+        db.document("_system/post_cache").set({"cache": cache})
+    except Exception:
+        pass
+
+
+def _fetch_post_images(uris: list) -> dict:
+    """Batch-fetch image URLs from the public Bluesky API (no auth required)."""
+    result = {}
+    for i in range(0, len(uris), 25):
+        batch = uris[i : i + 25]
+        try:
+            params = "&".join(f"uris[]={urllib.parse.quote(u, safe='')}" for u in batch)
+            req = urllib.request.Request(
+                f"https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts?{params}",
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            for post in data.get("posts", []):
+                uri = post.get("uri")
+                image_url = None
+                embed = post.get("embed") or {}
+                etype = embed.get("$type", "")
+                if etype == "app.bsky.embed.video#view":
+                    image_url = embed.get("thumbnail")
+                elif etype == "app.bsky.embed.images#view":
+                    imgs = embed.get("images", [])
+                    if imgs:
+                        image_url = imgs[0].get("thumb")
+                elif etype == "app.bsky.embed.recordWithMedia#view":
+                    media = embed.get("media") or {}
+                    if media.get("$type") == "app.bsky.embed.video#view":
+                        image_url = media.get("thumbnail")
+                    elif media.get("$type") == "app.bsky.embed.images#view":
+                        imgs = media.get("images", [])
+                        if imgs:
+                            image_url = imgs[0].get("thumb")
+                result[uri] = image_url
+        except Exception:
+            pass
+    return result
+
+
+def _attach_image_urls(posts: list) -> list:
+    """Attach image_url to each post dict, using cache and fetching missing entries."""
+    uris = [p["uri"] for p in posts]
+    cache = _load_post_cache()
+    uncached = [u for u in uris if u not in cache]
+    if uncached:
+        fetched = _fetch_post_images(uncached)
+        cache.update(fetched)
+        _save_post_cache(cache)
+    for p in posts:
+        p["image_url"] = cache.get(p["uri"])
+    return posts
+
+
 @app.get("/api/posts", dependencies=[_AUTH])
 def get_posts(range: str = "7d", sort: str = "recent", type: str = "all", period: Optional[str] = None):
-    start_dt, _ = _range_bounds(range)
-    try:
-        events = [d.to_dict() for d in db.collection("engagement_events").where(filter=_FF("created_at", ">=", start_dt.isoformat())).stream()]
-    except Exception:
-        events = []
+    if period:
+        bucket = next((b for b in _range_buckets(range) if b["label"] == period), None)
+        if bucket:
+            try:
+                events = [d.to_dict() for d in db.collection("engagement_events")
+                    .where(filter=_FF("created_at", ">=", bucket["start"].isoformat()))
+                    .where(filter=_FF("created_at", "<", bucket["end"].isoformat()))
+                    .stream()]
+            except Exception:
+                events = []
+        else:
+            events = []
+    else:
+        start_dt, _ = _range_bounds(range)
+        try:
+            events = [d.to_dict() for d in db.collection("engagement_events").where(filter=_FF("created_at", ">=", start_dt.isoformat())).stream()]
+        except Exception:
+            events = []
 
+    # Pass 1: seed from Sean's own posts only (type="post" events written by _snapshot_my_posts)
     posts_map: dict = {}
     for e in events:
-        uri = e.get("post_uri")
-        if not uri:
+        if e.get("type") != "post":
             continue
-        if uri not in posts_map:
-            posts_map[uri] = {
-                "uri": uri,
-                "text": e.get("post_text", ""),
-                "image_url": None,
-                "post_type": e.get("post_type_classification", ""),
-                "created_at": e.get("created_at", ""),
-                "fan_replies": 0,
-                "dm_pulls": 0,
-            }
-        if e.get("type") == "reply" and e.get("direction") == "inbound":
+        uri = e.get("post_uri")
+        if not uri or uri in posts_map:
+            continue
+        posts_map[uri] = {
+            "uri": uri,
+            "text": e.get("post_text", ""),
+            "image_url": None,
+            "post_type": e.get("post_type_classification", ""),
+            "created_at": e.get("created_at", ""),
+            "fan_replies": 0,
+            "dm_pulls": 0,
+        }
+
+    # Pass 2: overlay engagement metrics for known posts only
+    for e in events:
+        uri = e.get("post_uri")
+        if not uri or uri not in posts_map:
+            continue
+        if e.get("type") == "reply" and e.get("direction") == "outbound":
             posts_map[uri]["fan_replies"] += 1
         if e.get("reply_type") == "dm_pull":
             posts_map[uri]["dm_pulls"] += 1
-        if e.get("created_at", "") < posts_map[uri]["created_at"]:
-            posts_map[uri]["created_at"] = e["created_at"]
 
     posts = list(posts_map.values())
 
@@ -1669,7 +1990,7 @@ def get_posts(range: str = "7d", sort: str = "recent", type: str = "all", period
     else:
         posts.sort(key=lambda p: p.get("created_at", ""), reverse=True)
 
-    return {"range": range, "sort": sort, "type": type, "period_filter": period, "posts": posts[:50]}
+    return {"range": range, "sort": sort, "type": type, "period_filter": period, "posts": _attach_image_urls(posts[:50])}
 
 
 @app.get("/api/posts/{uri:path}", dependencies=[_AUTH])
@@ -1684,7 +2005,7 @@ def get_post(uri: str):
     if not events:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    fan_replies = sum(1 for e in events if e.get("type") == "reply" and e.get("direction") == "inbound")
+    fan_replies = sum(1 for e in events if e.get("type") == "reply" and e.get("direction") == "outbound")
     dm_pulls = sum(1 for e in events if e.get("reply_type") == "dm_pull")
     nudges = sum(1 for e in events if e.get("reply_type") == "nudge")
     intent_signals = sum(1 for e in events if e.get("direction") == "inbound" and e.get("fan_intent") in ("buying_signal", "curious"))
@@ -1712,10 +2033,16 @@ def get_post(uri: str):
                 except Exception:
                     pass
 
+    cache = _load_post_cache()
+    if uri not in cache:
+        fetched = _fetch_post_images([uri])
+        cache.update(fetched)
+        _save_post_cache(cache)
+
     return {
         "uri": uri,
         "text": first_e.get("post_text", ""),
-        "image_url": None,
+        "image_url": cache.get(uri),
         "post_type": post_type,
         "created_at": created_at,
         "created_label": created_label,

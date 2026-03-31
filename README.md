@@ -31,7 +31,7 @@ poller.py  ──── classify user ──────────────
     │                                                        │
     ├── creator reply ──► peer routing (collab / warm ack)  │
     │                                                        │
-    ├── like / repost ──► immediate DM (fan_pipeline.py)    │
+    ├── like / repost ──► queue DM (execute-engagement-dms)  │
     │                                                        │
     └── follow ──► queue DM (execute-dm-batch CF)           │
                                                              │
@@ -62,8 +62,14 @@ The reply bot runs entirely on your machine. It polls Bluesky for new notificati
 git clone <your-fork-url>
 cd sx-templates
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt        # covers reply bot + dashboard API
 cp bluesky/reply/.env.example bluesky/reply/.env
+```
+
+To run the test suite, install dev dependencies instead:
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
 ```
 
 ### A2. BrandVoice Configuration
@@ -107,7 +113,6 @@ Open `bluesky/reply/.env` and fill in the required fields:
 | `FAN_DISCOUNT_URL_REPLY` | Optional | Tracking URL for reply-thread DM pulls |
 | `DM_ENABLED` | Optional | Set `false` to disable proactive like/repost DMs (default `true`) |
 | `MAX_CONVERSATION_DEPTH` | Optional | Follow-up rounds before forcing a DM pull (default `3`) |
-| `MAX_DISCOUNTS_PER_DAY` | Optional | Daily cap on discount sends (default `5`) |
 
 See [`.env.example`](bluesky/reply/.env.example) for the full list including audience discovery and GCP variables.
 
@@ -193,10 +198,10 @@ The engagement system adds proactive outreach, strategic commenting, and audienc
 
 ### B1. What This Adds
 
-- **Proactive DMs** — likes and reposts trigger an immediate DM; follows are queued and batched (50/day cap)
+- **Proactive DMs** — likes and reposts are queued and drained every 5 min (active hours gate, bot scorer, 1hr recency window); follows are batched every 4 hours (50/day cap)
 - **Comment engine** — scans Tier 1/2 target accounts every 15 min, scores posts by engagement, posts on-brand comments (50/day cap, 20–30 min cadence)
 - **Audience discovery** — weekly starter pack scan + nightly follower graph analysis assigns accounts to Tier 1/2/3 as future comment and DM targets
-- **Inbound DM polling** — active conversations are checked every 5 min; human handoff flag silences automation when needed
+- **Inbound DM polling** — active conversations are checked every 3 min during 1-hour burst windows; active hours gate (7am–10pm Pacific); human handoff flag silences automation when needed
 
 ### B2. GCP Setup
 
@@ -263,20 +268,37 @@ The `BLUESKY_APP_PASSWORD`, `ANTHROPIC_API_KEY`, and brand voice content are inj
 ### B4. Deploy
 
 ```bash
-bash deploy.sh      # deploys 11 Cloud Functions
-bash scheduler.sh   # creates/updates all Cloud Scheduler jobs
+# Full deploy — commit, Cloud Functions, Scheduler, Cloud Run, Firebase Hosting
+bash deploy_all.sh "your commit message"
+
+# Skip steps you don't need
+SKIP_DASHBOARD=1 bash deploy_all.sh "fix: poller bug"
+SKIP_GIT=1 SKIP_FUNCTIONS=1 SKIP_SCHEDULER=1 bash deploy_all.sh  # hosting only
 ```
+
+On any failure the script pauses and prompts **[r]etry / [s]kip / [a]bort**.
+
+**Firebase headless auth (one-time setup):**
+```bash
+firebase login:ci   # prints a token — add to bluesky/reply/.env as FIREBASE_TOKEN=...
+```
+
+<!-- Manual steps (archived — use deploy_all.sh instead)
+bash deploy.sh      # deploys 12 Cloud Functions
+bash scheduler.sh   # creates/updates all Cloud Scheduler jobs
+-->
 
 **Cloud Functions and their schedules:**
 
 | Function | Schedule | Purpose |
 |---|---|---|
-| `poll-notifications` | every 5 min | Reply to thread notifications; send immediate like/repost DMs |
-| `poll-inbound-dms` | every 5 min | Check active DM conversations for fan replies |
+| `poll-notifications` | every 5 min | Reply to thread notifications; queue like/repost DMs |
+| `poll-inbound-dms` | every 3 min | Check active DM conversations (burst window + active hours gate) |
+| `execute-engagement-dms` | every 5 min | Drain like/repost/comment_exchange DM queue (60s DM write window) |
 | `scan-comment-targets` | every 15 min | Score Tier 1/2 posts and queue qualifying ones for commenting |
 | `execute-comment` | every 20 min | Post the next queued comment (respects write window + daily cap) |
-| `process-dm-queue` | every 2 hours | Pre-generate DM content for queued follow interactions |
-| `execute-dm-batch` | every 4 hours | Send batched follow DMs with 8–20 min stagger; pass `{"batch_size":0}` for a quick connectivity check |
+| `process-dm-queue` | every 2 hours | Pre-screen follow DM queue; mark already-DMed handles as skipped |
+| `execute-dm-batch` | every 4 hours | Send batched follow DMs with 5–15 min stagger; pass `{"batch_size":0}` for a quick connectivity check |
 | `follower-graph-prefetch` | Saturday 1am | Fetch all followers of your account; filter by quality signals |
 | `follower-graph-slot-0…4` | Nightly 2–5am | Process one 2000-fan slice per slot; count shared followees |
 | `follower-graph-score` | Nightly 5:30am | Assign Tier 1/2/3 to accounts based on discovery sources |
@@ -305,7 +327,7 @@ python bluesky/reply/admin.py clear-handoff @handle
 | Path | Purpose |
 |---|---|
 | `bluesky/shared/bluesky_client.py` | atproto SDK wrapper — session-persistent login, notifications, post, DM send/list |
-| `bluesky/shared/rate_limiter.py` | Centralized API rate limit manager (read: in-memory; write: Firestore-coordinated) |
+| `bluesky/shared/rate_limiter.py` | Rate limit manager — dual write windows: 4-min public (`check_write`), 60s DM (`check_dm_write`); `is_active_hours()` (7am–10pm Pacific) |
 | `bluesky/shared/firestore_client.py` | Firestore connection wrapper |
 | `bluesky/shared/activity_logger.py` | Logs function run metrics to Firestore `_system/activity_log` |
 
@@ -326,7 +348,7 @@ python bluesky/reply/admin.py clear-handoff @handle
 
 | Path | Purpose |
 |---|---|
-| `bluesky/engagement/fan_pipeline.py` | Immediate DM send, follow queue, batch executor, inbound DM polling |
+| `bluesky/engagement/fan_pipeline.py` | Engagement DM queue (`execute_engagement_dm_queue`), follow batch executor, inbound DM polling |
 | `bluesky/engagement/comment_engine.py` | Post scoring, comment generation, queue executor |
 | `bluesky/engagement/discovery.py` | Starter pack search + follower graph analysis → Tier 1/2/3 accounts |
 | `bluesky/engagement/handoff.py` | Human handoff detection and flag management |
@@ -335,16 +357,17 @@ python bluesky/reply/admin.py clear-handoff @handle
 
 | Path | Purpose |
 |---|---|
-| `functions/main.py` | HTTP-triggered entry points for all 11 Cloud Functions |
+| `functions/main.py` | HTTP-triggered entry points for all 12 Cloud Functions |
 | `deploy.sh` | Deploy all functions via `gcloud` |
 | `scheduler.sh` | Create/update all Cloud Scheduler jobs |
+| `deploy_all.sh` | Full deploy pipeline — git, functions, scheduler, Cloud Run, Firebase |
 
 **Web dashboard**
 
 | Path | Purpose |
 |---|---|
 | `bluesky/web/dashboard.html` | Single-page app — all dashboard pages in one file |
-| `bluesky/web/api/main.py` | FastAPI backend — 32 endpoints, deployed to Cloud Run |
+| `bluesky/web/api/main.py` | FastAPI backend — 34 endpoints, deployed to Cloud Run |
 | `bluesky/web/api/requirements.txt` | Backend dependencies |
 | `bluesky/web/Dockerfile` | Cloud Run container for the FastAPI backend |
 | `firebase.json` / `.firebaserc` | Firebase Hosting config — serves `dashboard.html` |
@@ -395,7 +418,7 @@ When a new template version is released:
 
 | File | Contents |
 |---|---|
-| `bluesky/reply/state.json` | `replied_posts`, `my_reply_uris`, `dm_pulls_by_root`, `conversation_depth`, `daily_discounts`, `blocked_users`, `paused_users`, `bot_status` |
+| `bluesky/reply/state.json` | `replied_posts`, `my_reply_uris`, `dm_pulls_by_root`, `conversation_depth`, `blocked_users`, `paused_users`, `bot_status` |
 | `bluesky/reply/dm_state.json` | Per-handle classification cache (`user_type`, `follower_count`, `classified_at`) and `last_checked_at` watermark |
 
 Override file locations with `STATE_PATH` and `DM_STATE_PATH` env vars. In Cloud Functions these are set to `/tmp/` automatically — state is ephemeral per container.
@@ -421,12 +444,14 @@ Override file locations with `STATE_PATH` and `DM_STATE_PATH` env vars. In Cloud
 
 ### C4. Rate Limiting
 
-The Bluesky API enforces a global write rate limit across all your Cloud Functions. The rate limiter in `bluesky/shared/rate_limiter.py` coordinates this:
+The Bluesky API enforces a global write rate limit across all your Cloud Functions. The rate limiter in `bluesky/shared/rate_limiter.py` coordinates this with two independent write windows:
 
 - **Reads** are tracked in-memory per process (IP-based; Firestore coordination adds cost with no benefit)
-- **Writes** are tracked in Firestore `_system/rate_state` — a global 4-minute window shared across all Cloud Functions
+- **Public write window** (`check_write`) — 4-minute global window tracked in Firestore `_system/rate_state` (`last_write_at`). Covers `post_reply()` and comment posts.
+- **DM write window** (`check_dm_write`) — 60-second window tracked separately (`last_dm_write_at`). Covers all DM sends. Fully independent of the public window — a burst of DMs does not delay replies and vice versa. Shares the same hourly/daily point budget.
+- **Active hours gate** (`is_active_hours`) — all outgoing actions are restricted to 7am–10pm America/Los_Angeles.
 
-All three write paths — `post_reply()`, DM sends, and comment posts — call `check_write()` before executing. If the window is not clear, `seconds_until_next_write()` returns the wait time and the function exits early; the item remains queued for the next invocation.
+If a window is not clear, the function exits early; the item remains queued for the next invocation.
 
 ---
 
@@ -463,12 +488,17 @@ CLI fallback: `python bluesky/reply/admin.py clear-handoff @handle`
 ### D1. Local Dev
 
 ```bash
-# Start the FastAPI backend (run from project root)
-uvicorn bluesky.web.api.main:app --reload --port 8000
+# Preferred: use the wrapper script (handles GCP credential check + env)
+bash run_local.sh
 
-# Open the SPA directly in your browser
+# Or manually (run from project root):
+set -a && source bluesky/reply/.env && set +a
+GOOGLE_CLOUD_PROJECT=sx-platform FIRESTORE_DATABASE=sxplatformdatabase \
+  uvicorn bluesky.web.api.main:app --port 8000
 open bluesky/web/dashboard.html
 ```
+
+> **Note:** Do not use `--reload` with uvicorn here — it spawns a second process that ignores Ctrl+C.
 
 On first load, set your dashboard secret in the browser console:
 ```js
@@ -480,9 +510,17 @@ The `API_BASE` auto-detects `file://` / `localhost` and points to `http://localh
 ### D2. Deploy
 
 ```bash
+# Full deploy (includes dashboard) — see B4
+bash deploy_all.sh "your commit message"
+
+# Dashboard only (skip git, functions, scheduler)
+SKIP_GIT=1 SKIP_FUNCTIONS=1 SKIP_SCHEDULER=1 bash deploy_all.sh
+```
+
+<!-- Manual steps (archived — use deploy_all.sh instead)
 # Build and push the dashboard API image via Cloud Build
 gcloud builds submit \
-  --config /tmp/cloudbuild-dashboard.yaml \
+  --config bluesky/web/cloudbuild.yaml \
   --project=YOUR_PROJECT_ID .
 
 # Deploy FastAPI to Cloud Run
@@ -499,7 +537,7 @@ gcloud run services update sx-dashboard-api \
 
 # Deploy the SPA to Firebase Hosting
 firebase deploy --only hosting --account your@email.com
-```
+-->
 
 **Required secrets** (add to Secret Manager before deploying):
 ```bash
@@ -510,5 +548,88 @@ echo -n "your-secret" | gcloud secrets versions add dashboard-secret --data-file
 **Required env var:**
 ```
 DASHBOARD_SECRET=    # Bearer token for all API endpoints
+```
+
+---
+
+## Module E — Setting Up on a New Machine
+
+Everything you need is in this repo plus your private `.env` file and brand voice file. Neither is committed — you transfer them separately.
+
+### E1. Clone and install
+
+```bash
+git clone https://github.com/SuperSeanXavier/sx-templates.git
+cd sx-templates
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### E2. Transfer your private files
+
+You need two files that live outside this repo:
+
+| File | What it is | Where to put it |
+|---|---|---|
+| `bluesky/reply/.env` | All your API keys, handles, and config | `bluesky/reply/.env` in the cloned repo |
+| Your brand voice file | Filled `brandvoice-template-v1.md` | Anywhere — set `BRANDVOICE_PATH` in `.env` to the absolute path |
+
+Copy them from your old machine (e.g. via AirDrop, scp, or a secure transfer):
+
+```bash
+# From old machine — copy .env
+scp old-machine:~/Documents/sx-templates/bluesky/reply/.env \
+    ~/Documents/sx-templates/bluesky/reply/.env
+
+# From old machine — copy brand voice (wherever you stored it)
+scp old-machine:~/my-brandvoice.md ~/my-brandvoice.md
+```
+
+Then confirm `BRANDVOICE_PATH` in `.env` matches the absolute path on the new machine.
+
+### E3. Authenticate with Google Cloud
+
+Required for dashboard local dev and any GCP features:
+
+```bash
+gcloud auth application-default login
+# Follow the browser prompt — picks up your sx-platform project credentials
+```
+
+If your GCP project or database name differ from the defaults in `run_local.sh`, update those values in the script.
+
+### E4. Run the reply bot
+
+```bash
+# Dry run — generates replies, prints them, nothing posts
+python bluesky/reply/poller.py --dry-run --once
+
+# One live cycle
+python bluesky/reply/poller.py --once
+```
+
+### E5. Run the dashboard locally
+
+```bash
+bash run_local.sh
+# Opens http://localhost:8000 and the dashboard in your browser
+```
+
+Set your dashboard secret in the browser console once:
+```js
+localStorage.setItem('dash_secret', 'your-DASHBOARD_SECRET-value')
+```
+
+### E6. Deploy from the new machine
+
+```bash
+# Install Firebase CLI if not present
+npm install -g firebase-tools
+
+# One-time: get a headless Firebase token and add it to .env as FIREBASE_TOKEN=...
+firebase login:ci
+
+# Full deploy
+bash deploy_all.sh "your commit message"
 ```
 
